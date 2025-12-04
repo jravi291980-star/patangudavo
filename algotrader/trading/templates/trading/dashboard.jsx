@@ -1,0 +1,312 @@
+import React, { useState, useEffect } from 'react';
+import { 
+  Settings, Activity, Target, TrendingUp, TrendingDown, 
+  ExternalLink, Ban, Power, ShieldAlert, DollarSign, Layers, BarChart2, X, Info 
+} from 'lucide-react';
+
+// NOTE: In a real app, use axios or fetch to get/post data to your Django backend
+// const API_URL = "http://localhost:8000/api";
+
+const Dashboard = () => {
+  // --- STATE ---
+  const [blacklistedStocks, setBlacklistedStocks] = useState(new Set());
+  const [isGlobalSettingsOpen, setIsGlobalSettingsOpen] = useState(false);
+  
+  // Real-time Data (would come from API polling)
+  const [pnlData, setPnlData] = useState({ bull: 2100, bear: -500 });
+  
+  // Global Settings (Volume Criteria)
+  const [globalSettings, setGlobalSettings] = useState({
+    volume_criteria: [
+      { id: 1, min_vol_price_cr: 5, sma_multiplier: 3.0 },
+      { id: 2, min_vol_price_cr: 10, sma_multiplier: 2.0 },
+      { id: 3, min_vol_price_cr: 25, sma_multiplier: 1.5 },
+    ]
+  });
+
+  const [bullSettings, setBullSettings] = useState({
+    risk_reward: "1:2", trailing_sl: "1:1", total_trades: 5, trades_per_stock: 3, 
+    risk_trade_1: 2000, risk_trade_2: 1500, risk_trade_3: 1000,
+    pnl_exit_enabled: false, max_profit: 5000, max_loss: 2000,
+  });
+
+  const [bearSettings, setBearSettings] = useState({
+    risk_reward: "1:2", trailing_sl: "1:1", total_trades: 5, trades_per_stock: 3,
+    risk_trade_1: 2000, risk_trade_2: 1500, risk_trade_3: 1000,
+    pnl_exit_enabled: false, max_profit: 5000, max_loss: 2000,
+  });
+
+  const [bullOrders, setBullOrders] = useState([
+    { id: 101, symbol: 'RELIANCE', entry: 2450.0, target: 2500.0, sl: 2430.0, status: 'OPEN', pnl: 1500, trade_count: 1 },
+    { id: 102, symbol: 'TATASTEEL', entry: 120.0, target: 125.0, sl: 118.0, status: 'CLOSED', pnl: 400, trade_count: 1 },
+  ]);
+
+  const [bullScanner, setBullScanner] = useState([
+    { id: 1, symbol: 'INFY', signal_strength: 'Breakout', price: 1450, time: '09:16:34', volume_price: '25Cr', candle_size: '0.45%' },
+    { id: 2, symbol: 'HDFCBANK', signal_strength: 'Breakout', price: 1600, time: '09:32:12', volume_price: '12Cr', candle_size: '0.60%' },
+  ]);
+
+  const [bearOrders, setBearOrders] = useState([
+    { id: 201, symbol: 'ADANIENT', entry: 2400.0, target: 2350.0, sl: 2420.0, status: 'OPEN', pnl: -500, trade_count: 1 },
+  ]);
+
+  const [bearScanner, setBearScanner] = useState([
+    { id: 1, symbol: 'WIPRO', signal_strength: 'Breakdown', price: 390, time: '09:18:56', volume_price: '8.2Cr', candle_size: '0.75%' },
+  ]);
+
+  // --- ACTIONS ---
+  const updateGlobalSetting = (index, field, value) => {
+    const newCriteria = [...globalSettings.volume_criteria];
+    newCriteria[index][field] = value;
+    setGlobalSettings({ ...globalSettings, volume_criteria: newCriteria });
+    // TODO: Send to Backend: axios.post(`${API_URL}/update-global-settings/`, { ... })
+  };
+
+  const toggleStopStock = (symbol) => {
+    const newSet = new Set(blacklistedStocks);
+    if (newSet.has(symbol)) {
+      newSet.delete(symbol); 
+      // TODO: axios.post(`${API_URL}/unblock-stock/`, { symbol })
+    } else {
+      newSet.add(symbol);
+      // TODO: axios.post(`${API_URL}/block-stock/`, { symbol })
+    }
+    setBlacklistedStocks(newSet);
+  };
+
+  const handleEngineUpdate = (side) => {
+    const settings = side === 'bull' ? bullSettings : bearSettings;
+    console.log(`Updating ${side} engine:`, settings);
+    // TODO: axios.post(`${API_URL}/update-engine/${side}/`, settings)
+  };
+
+  const openChart = (symbol) => {
+    window.open(`https://in.tradingview.com/chart/?symbol=NSE:${symbol}`, '_blank');
+  };
+
+  // --- DERIVED STATE ---
+  const totalGlobalPnL = pnlData.bull + pnlData.bear;
+  
+  const getSentimentStats = () => {
+    const bullCount = bullScanner.length;
+    const bearCount = bearScanner.length;
+    const total = bullCount + bearCount;
+    if (total === 0) return { percentage: 0, isBullish: true };
+    const percentage = Math.round(((bullCount - bearCount) / total) * 100);
+    return { percentage, isBullish: percentage >= 0, bullCount, bearCount };
+  };
+  const sentiment = getSentimentStats();
+
+  // --- SUB-COMPONENTS ---
+
+  const EngineSettings = ({ settings, setSettings, side }) => (
+    <div className="bg-gray-800 p-2 rounded-lg shadow-md border border-gray-700 mb-2">
+      <div className="flex items-center justify-between mb-1.5 border-b border-gray-700 pb-1">
+        <div className="flex items-center gap-1.5">
+          <Settings size={10} className="text-gray-400" />
+          <h3 className="font-bold text-gray-200 text-[10px]">Engine Config</h3>
+        </div>
+      </div>
+      
+      <div className="grid grid-cols-4 gap-1.5 mb-2">
+        <div>
+          <label className="block text-gray-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Risk:Rew</label>
+          <input type="text" value={settings.risk_reward} onChange={(e) => setSettings({...settings, risk_reward: e.target.value})} className="w-full border border-gray-600 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-gray-100" />
+        </div>
+        <div>
+          <label className="block text-gray-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Trail SL</label>
+          <input type="text" value={settings.trailing_sl} onChange={(e) => setSettings({...settings, trailing_sl: e.target.value})} className="w-full border border-gray-600 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-gray-100" />
+        </div>
+        <div>
+          <label className="block text-gray-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Max Trds</label>
+          <input type="number" value={settings.total_trades} onChange={(e) => setSettings({...settings, total_trades: e.target.value})} className="w-full border border-gray-600 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-gray-100" />
+        </div>
+        <div>
+          <label className="block text-blue-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Ent/Stk</label>
+          <input type="number" value={settings.trades_per_stock} onChange={(e) => setSettings({...settings, trades_per_stock: e.target.value})} className="w-full border border-blue-900 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-blue-100" />
+        </div>
+      </div>
+
+      <div className="mb-2 bg-gray-750 p-1 rounded border border-gray-600">
+         <div className="grid grid-cols-3 gap-1.5">
+            {[1, 2, 3].map(i => (
+              <div key={i} className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5">
+                <span className="text-gray-400 text-[13px] font-bold mr-1.5 flex-shrink-0">{i === 1 ? '1st' : i === 2 ? '2nd' : '3rd'}</span>
+                <input type="number" value={settings[`risk_trade_${i}`]} onChange={(e) => setSettings({...settings, [`risk_trade_${i}`]: e.target.value})} className="bg-transparent w-full text-[13px] font-bold text-gray-100 focus:outline-none" />
+              </div>
+            ))}
+         </div>
+      </div>
+
+      <div className={`p-1.5 rounded border flex items-center justify-between gap-2 h-7 ${settings.pnl_exit_enabled ? (side === 'bull' ? 'bg-emerald-900/20 border-emerald-800' : 'bg-rose-900/20 border-rose-800') : 'bg-gray-750 border-gray-700'}`}>
+        <div className="flex items-center gap-1 text-[9px] font-bold text-gray-300 whitespace-nowrap pl-1">
+           <DollarSign size={10} /> P&L Exit
+        </div>
+        <div className="flex items-center gap-1.5 flex-1">
+            <div className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5 flex-1">
+                <span className="text-gray-400 text-[8px] font-bold mr-1 flex-shrink-0">Tgt</span>
+                <input type="number" value={settings.max_profit} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_profit: e.target.value})} className="bg-transparent w-full text-[13px] font-bold text-green-400 focus:outline-none min-w-0" />
+            </div>
+            <div className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5 flex-1">
+                <span className="text-gray-400 text-[8px] font-bold mr-1 flex-shrink-0">Loss</span>
+                <input type="number" value={settings.max_loss} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_loss: e.target.value})} className="bg-transparent w-full text-[13px] font-bold text-red-400 focus:outline-none min-w-0" />
+            </div>
+        </div>
+        <div className="flex items-center pr-1">
+            <button onClick={() => setSettings({...settings, pnl_exit_enabled: !settings.pnl_exit_enabled})} className={`w-5 h-2.5 rounded-full flex items-center transition-colors px-0.5 ${settings.pnl_exit_enabled ? (side === 'bull' ? 'bg-emerald-500' : 'bg-rose-500') : 'bg-gray-600'}`}>
+                <div className={`w-1.5 h-1.5 bg-white rounded-full shadow-md transform transition-transform ${settings.pnl_exit_enabled ? 'translate-x-2.5' : 'translate-x-0'}`}></div>
+            </button>
+        </div>
+      </div>
+      <button onClick={() => handleEngineUpdate(side)} className={`w-full mt-2 py-1 rounded text-white text-[10px] font-bold transition-colors uppercase tracking-wide ${side === 'bull' ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-rose-700 hover:bg-rose-600'}`}>Update</button>
+    </div>
+  );
+
+  const OrderTable = ({ orders }) => (
+    <div className="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
+      <div className="flex items-center gap-2 mb-3 border-b border-gray-700 pb-2">
+        <Activity size={16} className="text-gray-400" />
+        <h3 className="font-semibold text-gray-200 text-sm">Executed Orders</h3>
+        <span className="ml-auto bg-gray-700 text-gray-300 text-[10px] px-2 py-0.5 rounded-full border border-gray-600">{orders.length} Orders</span>
+      </div>
+      <div className="overflow-x-auto flex-1">
+        <table className="w-full text-xs text-left text-gray-300">
+          <thead className="bg-gray-900 text-gray-400 font-medium uppercase">
+            <tr>
+              <th className="px-2 py-2">Stock</th>
+              <th className="px-2 py-2">Entry</th>
+              <th className="px-2 py-2">Tgt/SL</th>
+              <th className="px-2 py-2">P&L</th>
+              <th className="px-2 py-2 text-right">Actions</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-700">
+            {orders.map(order => {
+              const isBlocked = blacklistedStocks.has(order.symbol);
+              return (
+              <tr key={order.id} className={`hover:bg-gray-750 transition-colors ${isBlocked ? 'opacity-50' : ''}`}>
+                <td className="px-2 py-3">
+                  <div className={`font-bold text-sm ${isBlocked ? 'line-through text-red-400' : 'text-gray-100'}`}>
+                      {order.symbol} 
+                      {order.trade_count > 1 && <span className="ml-1 text-[9px] bg-gray-700 px-1 rounded text-gray-300">#{order.trade_count}</span>}
+                  </div>
+                  <button onClick={() => openChart(order.symbol)} className="text-[10px] text-blue-400 hover:text-blue-300 flex items-center gap-0.5 mt-0.5">Chart <ExternalLink size={8} /></button>
+                </td>
+                <td className="px-2 py-3 font-mono text-gray-300">{order.entry}</td>
+                <td className="px-2 py-3"><div className="text-green-400 font-medium">{order.target}</div><div className="text-red-400 font-medium">{order.sl}</div></td>
+                <td className="px-2 py-3"><span className={`font-mono font-bold ${order.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{order.pnl > 0 ? '+' : ''}{order.pnl}</span><div className={`mt-0.5 text-[9px] uppercase font-bold tracking-wider ${order.status === 'OPEN' ? 'text-blue-300' : 'text-gray-500'}`}>{order.status}</div></td>
+                <td className="px-2 py-3 text-right">
+                  <div className="flex justify-end gap-2">
+                    <button onClick={() => toggleStopStock(order.symbol)} className={`p-1.5 rounded border transition-colors ${isBlocked ? 'bg-red-900/20 border-red-800 text-red-500' : 'bg-gray-700 border-gray-600 text-gray-400'}`}><Ban size={12} /></button>
+                    {order.status === 'OPEN' && (<button className="bg-red-900/80 text-red-100 hover:bg-red-700 transition-colors px-2 py-1 rounded border border-red-700 text-[10px] font-bold uppercase">Exit</button>)}
+                  </div>
+                </td>
+              </tr>
+            )})}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+
+  const ScannerList = ({ scannerData }) => (
+    <div className="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
+       <div className="flex items-center gap-2 mb-3 border-b border-gray-700 pb-2">
+        <Target size={16} className="text-gray-400" />
+        <h3 className="font-semibold text-gray-200 text-sm">Scanner (1 Min Breakout)</h3>
+        <span className="ml-auto bg-gray-700 text-gray-300 text-[10px] px-2 py-0.5 rounded-full border border-gray-600">{scannerData.length}</span>
+      </div>
+      <div className="space-y-1 flex-1 overflow-y-auto">
+        {scannerData.map((item) => {
+          const isBlocked = blacklistedStocks.has(item.symbol);
+          return (
+          <div key={item.id} className={`flex items-center gap-2 p-2 rounded bg-gray-750 border border-gray-700 transition-all ${isBlocked ? 'opacity-50 grayscale' : 'hover:border-blue-500/50 hover:bg-gray-700'}`}>
+            <div className={`font-bold text-xs w-20 flex items-center gap-1 ${isBlocked ? 'line-through text-gray-500' : 'text-gray-200'}`}>{item.symbol}<button onClick={() => openChart(item.symbol)} className="text-gray-500 hover:text-blue-400"><ExternalLink size={10} /></button></div>
+            <div className="text-[10px] text-gray-400 font-mono w-16">{item.time}</div>
+            <div className={`text-[10px] font-bold uppercase w-16 truncate ${item.signal_strength.includes('Breakout') ? 'text-green-400' : 'text-red-400'}`}>{item.signal_strength}</div>
+            <div className="flex items-center gap-1 text-[10px]"><span className="text-gray-500">VP:</span><span className="font-extrabold text-amber-300">{item.volume_price}</span></div>
+            <div className="flex items-center gap-1 text-[10px]"><span className="text-gray-500">Sz:</span><span className="font-extrabold text-cyan-300">{item.candle_size}</span></div>
+            <div className="ml-auto font-mono font-bold text-gray-300 text-xs">₹{item.price}</div>
+            <button onClick={() => toggleStopStock(item.symbol)} className={`p-1 rounded-full flex-shrink-0 transition-colors ml-2 ${isBlocked ? 'text-red-500 bg-red-900/20' : 'text-gray-500 hover:text-red-400 hover:bg-gray-600'}`}><Ban size={14} /></button>
+          </div>
+        )})}
+      </div>
+    </div>
+  );
+
+  return (
+    <div className="min-h-screen bg-gray-950 font-sans flex flex-col text-gray-100">
+      <header className="bg-gray-900 border-b border-gray-800 px-3 py-1 shadow-lg flex justify-between items-center sticky top-0 z-30 h-10">
+        <div className="flex items-center gap-2">
+           <div className="w-5 h-5 bg-blue-700 rounded flex items-center justify-center font-bold text-[9px] text-white shadow-lg">KM</div>
+           <h1 className="text-xl font-bold tracking-tight text-gray-100 leading-none">Kite <span className="text-blue-500 font-light">Master</span></h1>
+        </div>
+        <div className="flex items-center gap-4 ml-auto">
+            <div className="text-[10px] font-bold uppercase tracking-wider flex items-center gap-2 bg-gray-800 px-2 py-0.5 rounded border border-gray-700">
+                <span className="text-gray-400">Total P&L:</span>
+                <span className={`text-sm ${totalGlobalPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{totalGlobalPnL > 0 ? '+' : ''}{totalGlobalPnL}</span>
+            </div>
+            <div className={`flex items-center gap-2 px-3 py-0.5 rounded border ${sentiment.isBullish ? 'bg-emerald-950/20 border-emerald-500/20' : 'bg-rose-950/20 border-rose-500/20'}`}>
+                <div className="flex items-center gap-1"><BarChart2 size={14} className={sentiment.isBullish ? 'text-emerald-400' : 'text-rose-400'} /><span className={`text-sm font-black tracking-tight ${sentiment.isBullish ? 'text-emerald-400' : 'text-rose-400'}`}>{sentiment.percentage > 0 ? '+' : ''}{sentiment.percentage}%</span></div>
+                <div className="h-4 w-px bg-gray-700"></div>
+                <div className="text-[10px] font-mono font-bold text-gray-400 flex gap-2"><span>BULL: <span className="text-emerald-400">{sentiment.bullCount}</span></span><span>BEAR: <span className="text-rose-400">{sentiment.bearCount}</span></span></div>
+            </div>
+            <div className="flex items-center gap-3 text-[9px]">
+               <button onClick={() => setIsGlobalSettingsOpen(true)} className="text-gray-400 hover:text-blue-400 transition-colors p-1 rounded hover:bg-gray-800" title="Global Settings"><Settings size={14} /></button>
+               <span className="flex items-center gap-1 text-emerald-400 font-medium bg-emerald-900/20 px-1.5 py-0.5 rounded border border-emerald-900/50"><div className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"></div> Redis Connected</span>
+               <span className="text-gray-400 border-l border-gray-700 pl-2 hidden md:inline">Master Super User</span>
+            </div>
+        </div>
+      </header>
+      
+      {isGlobalSettingsOpen && (
+        <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm">
+          <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-2xl w-96 p-5">
+            <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
+              <h3 className="text-sm font-bold text-gray-200 flex items-center gap-2"><Settings size={16} /> Global Volume SMA Criteria</h3>
+              <button onClick={() => setIsGlobalSettingsOpen(false)} className="text-gray-400 hover:text-white transition-colors"><X size={18} /></button>
+            </div>
+            <div className="space-y-4">
+              <div className="bg-blue-900/20 border border-blue-800/50 rounded p-2 text-xs text-blue-300 flex items-start gap-2"><Info size={14} className="mt-0.5 flex-shrink-0" /><span>Engines pass if <strong>ANY</strong> of the 3 criteria levels below are met.</span></div>
+              <div className="grid grid-cols-3 gap-2 text-xs font-bold text-gray-400 uppercase tracking-wider mb-1"><div className="pl-1">Level</div><div>Min Vol Price (Cr)</div><div>SMA Multiplier</div></div>
+              {globalSettings.volume_criteria.map((criteria, index) => (
+                <div key={criteria.id} className="grid grid-cols-3 gap-2 items-center bg-gray-900/50 p-2 rounded border border-gray-700">
+                   <div className="text-sm font-bold text-gray-300 pl-1">Level {criteria.id}</div>
+                   <input type="number" value={criteria.min_vol_price_cr} onChange={(e) => updateGlobalSetting(index, 'min_vol_price_cr', e.target.value)} className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-center text-amber-400 font-mono font-bold focus:border-blue-500 outline-none" />
+                   <div className="flex items-center"><span className="text-gray-500 mr-1 text-xs">x</span><input type="number" value={criteria.sma_multiplier} onChange={(e) => updateGlobalSetting(index, 'sma_multiplier', e.target.value)} className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-center text-cyan-400 font-mono font-bold focus:border-blue-500 outline-none w-full" /></div>
+                </div>
+              ))}
+              <div className="pt-2"><button onClick={() => setIsGlobalSettingsOpen(false)} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 rounded transition-colors uppercase tracking-wider shadow-lg">Save Global Criteria</button></div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <main className="p-4 grid grid-cols-2 gap-4 flex-1 items-start">
+        <section className="flex flex-col bg-gray-900 p-3 rounded-xl border-t-4 border-emerald-600 shadow-xl min-h-full">
+          <div className="flex items-center gap-2 mb-2 text-emerald-100 bg-emerald-900/20 p-1.5 rounded-lg border border-emerald-800/30">
+            <TrendingUp size={14} className="text-emerald-400" />
+            <h2 className="text-[9px] font-bold uppercase tracking-wider flex-1 flex items-center gap-2">BULL P&L: <span className={`text-sm ${pnlData.bull >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pnlData.bull > 0 ? '+' : ''}{pnlData.bull}</span></h2>
+            <button className="bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold uppercase px-1.5 py-1 rounded flex items-center gap-1 shadow-md border border-red-500 transition-transform active:scale-95"><ShieldAlert size={12} /> EXIT ALL</button>
+          </div>
+          <EngineSettings settings={bullSettings} setSettings={setBullSettings} side="bull" />
+          <OrderTable orders={bullOrders} />
+          <ScannerList scannerData={bullScanner} />
+        </section>
+
+        <section className="flex flex-col bg-gray-900 p-3 rounded-xl border-t-4 border-rose-600 shadow-xl min-h-full">
+           <div className="flex items-center gap-2 mb-2 text-rose-100 bg-rose-900/20 p-1.5 rounded-lg border border-rose-800/30">
+            <TrendingDown size={14} className="text-rose-400" />
+            <h2 className="text-[9px] font-bold uppercase tracking-wider flex-1 flex items-center gap-2">BEAR P&L: <span className={`text-sm ${pnlData.bear >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pnlData.bear > 0 ? '+' : ''}{pnlData.bear}</span></h2>
+            <button className="bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold uppercase px-1.5 py-1 rounded flex items-center gap-1 shadow-md border border-red-500 transition-transform active:scale-95"><ShieldAlert size={12} /> EXIT ALL</button>
+          </div>
+          <EngineSettings settings={bearSettings} setSettings={setBearSettings} side="bear" />
+          <OrderTable orders={bearOrders} />
+          <ScannerList scannerData={bearScanner} />
+        </section>
+      </main>
+    </div>
+  );
+};
+
+export default Dashboard;
