@@ -4,6 +4,7 @@ from trading import views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('', views.home, name='home'),  # <--- Add this line for the homepage
     
     # --- Kite Connect Authentication ---
     # These match the Dashboard's "Initiate Kite Login" button and Zerodha's redirect setting
