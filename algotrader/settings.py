@@ -1386,3 +1386,8 @@ BTST_STOCK_UNIVERSE=['360ONE', '3MINDIA', 'AAVAS', 'ABB', 'ABBOTINDIA', 'ABDL', 
 'ZUBENELGENUBI', 'ZYDUSLIFE', 'ZYDUSWELL','LGHL','BLUESTONE','RAMAPHO',]
 
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+# When a user is not logged in, redirect them to the Admin Login page
+LOGIN_URL = '/admin/login/'
+
+# After logging in, redirect them to the dashboard
+LOGIN_REDIRECT_URL = '/'
