@@ -5,6 +5,11 @@ from trading import views
 urlpatterns = [
     path('admin/', admin.site.urls),
     
+    # --- Kite Connect Authentication ---
+    # These match the Dashboard's "Initiate Kite Login" button and Zerodha's redirect setting
+    path('api/kite/login/', views.kite_login, name='kite_login'),
+    path('api/kite/callback/', views.kite_callback, name='kite_callback'),
+
     # --- Dashboard API Endpoints ---
     path('api/stats/', views.dashboard_stats, name='dashboard_stats'),
     
