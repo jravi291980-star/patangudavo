@@ -6,7 +6,7 @@ from trading.models import Account
 from trading.bull_engine import CashBreakoutClient
 from trading.bear_engine import CashBreakdownClient
 # from trading.websockets import start_websocket_thread, start_fno_websocket_thread
-from trading.websockets import start_websocket_thread
+from trading.websockets import start_websocket_thread , start_fno_websocket_thread
 
 logger = logging.getLogger(__name__)
 
