@@ -25,6 +25,13 @@
         ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
         ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
         body { background-color: #030712; } /* Darker than gray-950 */
+        
+        /* Toast Animation */
+        @keyframes slideIn {
+            from { transform: translateY(100%); opacity: 0; }
+            to { transform: translateY(0); opacity: 1; }
+        }
+        .toast-enter { animation: slideIn 0.3s ease-out forwards; }
     </style>
 </head>
 <body>
@@ -32,7 +39,7 @@
 
     <script type="text/babel">
         // --- SETUP GLOBALS ---
-        const { useState, useEffect } = React;
+        const { useState, useEffect, useCallback } = React;
         const API_URL = "/api"; 
 
         // --- ICON WRAPPER COMPONENT ---
@@ -53,12 +60,28 @@
         const Power = (p) => <Icon name="power" {...p} />;
         const ShieldAlert = (p) => <Icon name="shield-alert" {...p} />;
         const DollarSign = (p) => <Icon name="dollar-sign" {...p} />;
-        const Layers = (p) => <Icon name="layers" {...p} />;
         const BarChart2 = (p) => <Icon name="bar-chart-2" {...p} />;
         const X = (p) => <Icon name="x" {...p} />;
         const Info = (p) => <Icon name="info" {...p} />;
         const Key = (p) => <Icon name="key" {...p} />;
         const CheckCircle = (p) => <Icon name="check-circle" {...p} />;
+
+        // --- TOAST NOTIFICATION COMPONENT ---
+        const Toast = ({ message, type, onClose }) => {
+            useEffect(() => {
+                const timer = setTimeout(onClose, 3000);
+                return () => clearTimeout(timer);
+            }, [onClose]);
+
+            const bgClass = type === 'error' ? 'bg-red-600' : 'bg-emerald-600';
+            
+            return (
+                <div className={`fixed bottom-5 right-5 ${bgClass} text-white px-4 py-3 rounded shadow-lg z-50 flex items-center gap-2 toast-enter`}>
+                    {type === 'error' ? <ShieldAlert size={16}/> : <CheckCircle size={16}/>}
+                    <span className="text-xs font-bold">{message}</span>
+                </div>
+            );
+        };
 
         // --- MAIN DASHBOARD COMPONENT ---
         const Dashboard = () => {
@@ -68,6 +91,7 @@
             const [isCredentialsOpen, setIsCredentialsOpen] = useState(false);
             const [isAuthPending, setIsAuthPending] = useState(false);
             const [isConnected, setIsConnected] = useState(false);
+            const [toast, setToast] = useState(null); // { message, type }
             
             // Real-time Data
             const [pnlData, setPnlData] = useState({ bull: 0, bear: 0, total: 0 });
@@ -81,9 +105,9 @@
 
             const [globalSettings, setGlobalSettings] = useState({
                 volume_criteria: [
-                { id: 1, min_vol_price_cr: 5, sma_multiplier: 3.0 },
-                { id: 2, min_vol_price_cr: 10, sma_multiplier: 2.0 },
-                { id: 3, min_vol_price_cr: 25, sma_multiplier: 1.5 },
+                    { id: 1, min_vol_price_cr: 5, sma_multiplier: 3.0 },
+                    { id: 2, min_vol_price_cr: 10, sma_multiplier: 2.0 },
+                    { id: 3, min_vol_price_cr: 25, sma_multiplier: 1.5 },
                 ]
             });
 
@@ -104,34 +128,86 @@
             const [bullScanner, setBullScanner] = useState([]);
             const [bearScanner, setBearScanner] = useState([]);
 
-            // --- DATA FETCHING ---
-            const fetchInitialData = async () => {
-                try {
-                // MOCK DATA for Demo Purposes
-                setIsConnected(true);
-                setPnlData({ bull: 2100, bear: -500, total: 1600 });
-                setEngineStatus({ bull: '1', bear: '0' }); 
-                setBullOrders([
-                    { id: 101, symbol: 'RELIANCE', entry: 2450.0, target: 2500.0, sl: 2430.0, status: 'OPEN', pnl: 1500, trade_count: 1 },
-                ]);
-                setBearOrders([
-                    { id: 201, symbol: 'ADANIENT', entry: 2400.0, target: 2350.0, sl: 2420.0, status: 'OPEN', pnl: -500, trade_count: 1 },
-                ]);
-                setBullScanner([
-                    { id: 1, symbol: 'TATASTEEL', time: '10:30', signal_strength: 'Breakout', volume_price: '50Cr', candle_size: 'Large', price: 120 }
-                ]);
+            // --- HELPER FUNCTIONS ---
+            const showToast = (msg, type = 'success') => setToast({ message: msg, type });
 
-                } catch (error) {
-                    console.error("Error fetching dashboard data:", error);
-                    setIsConnected(false);
+            // --- API INTERACTION ---
+            const apiCall = async (endpoint, method = 'GET', body = null) => {
+                try {
+                    const options = {
+                        method,
+                        headers: { 'Content-Type': 'application/json' },
+                    };
+                    if (body) options.body = JSON.stringify(body);
+                    const res = await fetch(endpoint, options);
+                    const data = await res.json();
+                    if (!res.ok) throw new Error(data.message || data.error || 'Request failed');
+                    return data;
+                } catch (err) {
+                    console.error(`API Error (${endpoint}):`, err);
+                    showToast(err.message, 'error');
+                    return null;
                 }
             };
-            
-            useEffect(() => {
-                fetchInitialData();
-                setTimeout(() => lucide.createIcons(), 100);
+
+            // --- DATA LOADING ---
+            const fetchAllData = useCallback(async () => {
+                // 1. Stats & PnL
+                const stats = await apiCall(`${API_URL}/stats/`);
+                if (stats) {
+                    setPnlData(stats.pnl);
+                    setEngineStatus(stats.engine_status);
+                }
+
+                // 2. Orders
+                const orders = await apiCall(`${API_URL}/orders/`);
+                if (orders) {
+                    setBullOrders(orders.bull);
+                    setBearOrders(orders.bear);
+                }
+
+                // 3. Scanner
+                const scan = await apiCall(`${API_URL}/scanner/`);
+                if (scan) {
+                    setBullScanner(scan.bull);
+                    setBearScanner(scan.bear);
+                }
             }, []);
 
+            const loadSettings = useCallback(async () => {
+                // 1. Global Settings (API Keys & Vol Criteria)
+                const global = await apiCall(`${API_URL}/settings/global/`);
+                if (global) {
+                    setCredentials({ 
+                        apiKey: global.api_key || '', 
+                        apiSecret: global.api_secret || '',
+                        accessToken: '' 
+                    });
+                    if (global.volume_criteria) {
+                        setGlobalSettings(prev => ({ ...prev, volume_criteria: global.volume_criteria }));
+                    }
+                    if (global.api_key && global.api_secret) setIsConnected(true); // Basic check
+                }
+
+                // 2. Engine Settings
+                const bull = await apiCall(`${API_URL}/settings/engine/bull/`);
+                if (bull) setBullSettings(prev => ({...prev, ...bull}));
+
+                const bear = await apiCall(`${API_URL}/settings/engine/bear/`);
+                if (bear) setBearSettings(prev => ({...prev, ...bear}));
+
+            }, []);
+
+            // Initial Load
+            useEffect(() => {
+                loadSettings();
+                fetchAllData();
+                const interval = setInterval(fetchAllData, 3000); // Poll every 3s
+                setTimeout(() => lucide.createIcons(), 100);
+                return () => clearInterval(interval);
+            }, [fetchAllData, loadSettings]);
+
+            // Re-render icons on updates
             useEffect(() => {
                 lucide.createIcons();
             });
@@ -139,35 +215,77 @@
             // --- ACTIONS ---
             const initiateKiteLogin = () => { window.location.href = `${API_URL}/kite/login/`; };
 
+            // SAVE CREDENTIALS
             const saveCredentials = async () => {
-                console.log("Saving credentials:", credentials);
-                setIsCredentialsOpen(false);
+                const payload = { api_key: credentials.apiKey, api_secret: credentials.apiSecret };
+                const res = await apiCall(`${API_URL}/settings/global/`, 'POST', payload);
+                if (res) {
+                    showToast("Credentials Saved Successfully");
+                    setIsCredentialsOpen(false);
+                }
             };
 
+            // SAVE GLOBAL CRITERIA (Volume/SMA)
+            const saveGlobalCriteria = async () => {
+                const payload = { volume_criteria: globalSettings.volume_criteria };
+                const res = await apiCall(`${API_URL}/settings/global/`, 'POST', payload);
+                if (res) {
+                    showToast("Global Criteria Updated");
+                    setIsGlobalSettingsOpen(false);
+                }
+            };
+
+            // UPDATE STATE FOR GLOBAL SETTINGS
             const updateGlobalSetting = (index, field, value) => {
                 const newCriteria = [...globalSettings.volume_criteria];
-                newCriteria[index][field] = value;
+                newCriteria[index][field] = parseFloat(value);
                 setGlobalSettings({ ...globalSettings, volume_criteria: newCriteria });
             };
 
+            // TOGGLE ENGINE
             const toggleEngine = async (side, enabled) => {
+                // Optimistic Update
                 setEngineStatus(prev => ({ ...prev, [side]: enabled ? '1' : '0' }));
+                
+                const res = await apiCall(`${API_URL}/control/`, 'POST', {
+                    action: 'toggle_engine',
+                    side: side,
+                    enabled: enabled
+                });
+                
+                if (res) showToast(`${side.toUpperCase()} Engine ${enabled ? 'Started' : 'Stopped'}`);
+                else setEngineStatus(prev => ({ ...prev, [side]: !enabled ? '1' : '0' })); // Revert on fail
             };
 
+            // UPDATE ENGINE SETTINGS (Risk, Max Profit etc)
             const handleEngineUpdate = async (side) => {
-                console.log(`Updated ${side} engine.`);
+                const settings = side === 'bull' ? bullSettings : bearSettings;
+                const res = await apiCall(`${API_URL}/settings/engine/${side}/`, 'POST', settings);
+                if (res) showToast(`${side.toUpperCase()} Settings Saved`);
             };
 
-            const toggleStopStock = (symbol) => {
-                const newSet = new Set(blacklistedStocks);
-                if (newSet.has(symbol)) newSet.delete(symbol);
-                else newSet.add(symbol);
-                setBlacklistedStocks(newSet);
+            // PANIC EXIT
+            const panicExit = async (side) => {
+                if(window.confirm(`⚠️ CRITICAL: PANIC EXIT ${side.toUpperCase()}? This will close all open positions immediately.`)) {
+                    const res = await apiCall(`${API_URL}/control/`, 'POST', { action: 'panic_exit', side });
+                    if(res) showToast(`Panic Signal Sent to ${side.toUpperCase()}`);
+                }
             };
 
-            const panicExit = (side) => {
-                if(window.confirm(`PANIC EXIT ${side.toUpperCase()}?`)) {
-                    console.log(`Panic signal sent to ${side}`);
+            const toggleStopStock = async (symbol) => {
+                // Assuming ban_symbol API exists or local logic
+                // Here simply adding to blacklist locally, API would be better
+                const isBanned = blacklistedStocks.has(symbol);
+                const action = isBanned ? 'unban_symbol' : 'ban_symbol';
+                
+                const res = await apiCall(`${API_URL}/control/`, 'POST', { action, symbol });
+                
+                if (res) {
+                    const newSet = new Set(blacklistedStocks);
+                    if (isBanned) newSet.delete(symbol);
+                    else newSet.add(symbol);
+                    setBlacklistedStocks(newSet);
+                    showToast(`${symbol} ${isBanned ? 'Unbanned' : 'Banned'}`);
                 }
             };
 
@@ -233,7 +351,7 @@
                         {[1, 2, 3].map(i => (
                             <div key={i} className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5">
                             <span className="text-gray-400 text-[13px] font-bold mr-1.5 flex-shrink-0">{i === 1 ? '1st' : i === 2 ? '2nd' : '3rd'}</span>
-                            <input type="number" value={settings[`risk_trade_${i}`]} onChange={(e) => setSettings({...settings, [`risk_trade_${i}`]: e.target.value})} className="bg-transparent w-full text-[13px] font-bold text-gray-100 focus:outline-none" />
+                            <input type="number" value={settings[`risk_trade_${i}`]} onChange={(e) => setSettings({...settings, [`risk_trade_${i}`]: parseFloat(e.target.value)})} className="bg-transparent w-full text-[13px] font-bold text-gray-100 focus:outline-none" />
                             </div>
                         ))}
                         </div>
@@ -246,11 +364,11 @@
                     <div className="flex items-center gap-1.5 flex-1">
                         <div className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5 flex-1">
                             <span className="text-gray-400 text-[8px] font-bold mr-1 flex-shrink-0">Tgt</span>
-                            <input type="number" value={settings.max_profit} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_profit: e.target.value})} className="bg-transparent w-full text-[13px] font-bold text-green-400 focus:outline-none min-w-0" />
+                            <input type="number" value={settings.max_profit} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_profit: parseFloat(e.target.value)})} className="bg-transparent w-full text-[13px] font-bold text-green-400 focus:outline-none min-w-0" />
                         </div>
                         <div className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5 flex-1">
                             <span className="text-gray-400 text-[8px] font-bold mr-1 flex-shrink-0">Loss</span>
-                            <input type="number" value={settings.max_loss} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_loss: e.target.value})} className="bg-transparent w-full text-[13px] font-bold text-red-400 focus:outline-none min-w-0" />
+                            <input type="number" value={settings.max_loss} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_loss: parseFloat(e.target.value)})} className="bg-transparent w-full text-[13px] font-bold text-red-400 focus:outline-none min-w-0" />
                         </div>
                     </div>
                     <div className="flex items-center pr-1">
@@ -338,6 +456,8 @@
             // --- RENDER ---
             return (
                 <div className="min-h-screen bg-gray-950 font-sans flex flex-col text-gray-100">
+                {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+                
                 <header className="bg-gray-900 border-b border-gray-800 px-3 py-1 shadow-lg flex justify-between items-center sticky top-0 z-30 h-10">
                     <div className="flex items-center gap-2">
                         <div className="w-5 h-5 bg-blue-700 rounded flex items-center justify-center font-bold text-[9px] text-white shadow-lg">KM</div>
@@ -358,7 +478,9 @@
                             <button onClick={() => setIsCredentialsOpen(true)} className="text-gray-400 hover:text-blue-400 transition-colors p-1 rounded hover:bg-gray-800" title="API Credentials"><Key size={14} /></button>
                             
                             <button onClick={() => setIsGlobalSettingsOpen(true)} className="text-gray-400 hover:text-blue-400 transition-colors p-1 rounded hover:bg-gray-800" title="Global Settings"><Settings size={14} /></button>
-                            <span className="flex items-center gap-1 text-emerald-400 font-medium bg-emerald-900/20 px-1.5 py-0.5 rounded border border-emerald-900/50"><div className="w-1 h-1 rounded-full bg-emerald-500 animate-pulse"></div> Redis Connected</span>
+                            <span className={`flex items-center gap-1 font-medium px-1.5 py-0.5 rounded border ${isConnected ? 'text-emerald-400 bg-emerald-900/20 border-emerald-900/50' : 'text-red-400 bg-red-900/20 border-red-900/50'}`}>
+                                <div className={`w-1 h-1 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-red-500'} animate-pulse`}></div> {isConnected ? 'System Ready' : 'API Missing'}
+                            </span>
                             <span className="text-gray-400 border-l border-gray-700 pl-2 hidden md:inline">Master Super User</span>
                         </div>
                     </div>
@@ -379,7 +501,7 @@
                             <input type="text" className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-xs text-gray-200 focus:border-blue-500 outline-none" value={credentials.apiKey} onChange={(e) => setCredentials({...credentials, apiKey: e.target.value})} placeholder="Enter Kite API Key" />
                         </div>
                         <div>
-                            <label className="block text-gray-400 text-xs font-bold mb-1">API Secret (Optional/Server-side)</label>
+                            <label className="block text-gray-400 text-xs font-bold mb-1">API Secret</label>
                             <input type="password" className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-xs text-gray-200 focus:border-blue-500 outline-none" value={credentials.apiSecret} onChange={(e) => setCredentials({...credentials, apiSecret: e.target.value})} placeholder="Enter Secret" />
                         </div>
                         
@@ -388,7 +510,7 @@
                             <button onClick={initiateKiteLogin} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold py-2 rounded transition-colors flex items-center justify-center gap-1"><Power size={12} /> Login to Kite</button>
                         </div>
                         
-                        {isConnected && <div className="text-center text-[10px] text-emerald-500 flex items-center justify-center gap-1 mt-2"><CheckCircle size={10} /> Session Active</div>}
+                        {isConnected && <div className="text-center text-[10px] text-emerald-500 flex items-center justify-center gap-1 mt-2"><CheckCircle size={10} /> Keys Configured</div>}
                         </div>
                     </div>
                     </div>
@@ -412,7 +534,7 @@
                                 <div className="flex items-center"><span className="text-gray-500 mr-1 text-xs">x</span><input type="number" value={criteria.sma_multiplier} onChange={(e) => updateGlobalSetting(index, 'sma_multiplier', e.target.value)} className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-center text-cyan-400 font-mono font-bold focus:border-blue-500 outline-none w-full" /></div>
                             </div>
                         ))}
-                        <div className="pt-2"><button onClick={() => setIsGlobalSettingsOpen(false)} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 rounded transition-colors uppercase tracking-wider shadow-lg">Save Global Criteria</button></div>
+                        <div className="pt-2"><button onClick={saveGlobalCriteria} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 rounded transition-colors uppercase tracking-wider shadow-lg">Save Global Criteria</button></div>
                         </div>
                     </div>
                     </div>
