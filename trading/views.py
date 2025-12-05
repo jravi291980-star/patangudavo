@@ -47,7 +47,11 @@ def kite_login(request):
     
     # The redirect_url should match what you set in the Kite Developer Console
     return redirect(kite.login_url())
+from django.http import HttpResponse
 
+# Add this function
+def home(request):
+    return HttpResponse("<h1>Algo Trading Bot is Active</h1><p>Worker is running.</p>")
 @login_required
 def kite_callback(request):
     """
