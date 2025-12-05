@@ -114,6 +114,38 @@ class CashBreakoutClient:
         except: pass
 
         self._load_trades_from_db()
+# ------------------- Daily housekeeping -------------------
+    def _daily_reset_trades(self) -> None:
+        """Reset DB + Redis state once per day after DAILY_RESET_TIME."""
+        now_ist = dt.now(IST)
+        reset_time_passed = now_ist.time() >= self.DAILY_RESET_TIME
+
+        target_reset_date = now_ist.date()
+        if now_ist.time() < dt_time(0, 30):
+            target_reset_date = now_ist.date() - timedelta(days=1)
+
+        reset_flag_key = f"cbd_daily_reset_done:{self.account.id}:{target_reset_date.isoformat()}"
+
+        if reset_time_passed and redis_client.set(reset_flag_key, "1", nx=True, ex=86400 * 2):
+            logger.warning("CBD(%s): Performing daily reset for date=%s", self.account.user.username, target_reset_date)
+            try:
+                CashBreakdownTrade.objects.filter(account=self.account).delete()
+                with redis_client.pipeline() as pipe:
+                    pipe.delete(self.trade_count_key)
+                    pipe.delete(self.limit_reached_key)
+                    pipe.delete(self.active_entries_set)
+                    pipe.delete(self.exiting_trades_set)
+                    pipe.delete(self.daily_pnl_key)
+                    for key in redis_client.keys(f"{self.entry_lock_key_prefix}:*"):
+                        pipe.delete(key)
+                    pipe.execute()
+
+                self.open_trades.clear()
+                self.pending_trades.clear()
+                logger.info("CBD(%s): Daily reset complete.", self.account.user.username)
+            except Exception as e:
+                logger.critical("CBD(%s): Daily reset failed: %s", self.account.user.username, e, exc_info=True)
+                redis_client.delete(reset_flag_key)
 
     # ------------------- Settings & Status Fetching -------------------
     def _get_global_settings(self) -> Dict[str, Any]:
