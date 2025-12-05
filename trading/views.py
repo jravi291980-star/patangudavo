@@ -54,7 +54,7 @@ def kite_login(request):
 
 def home(request):
     # This tells Django to send the 'dashboard.html' file to the user
-    return render(request, 'dashboard.html')
+    return render(request, 'trading/dashboard.html')
 @login_required
 def kite_callback(request):
     """
