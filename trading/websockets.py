@@ -1429,28 +1429,48 @@
 #     logger.info("FNO_WEBSOCKET: FnoTickerManager (NFO/Options) thread has been started.")
 #     return fno_ticker_manager
 
-import threading
-import time
+"""
+Refactored Websocket / Instrument / Candle manager for KiteConnect
+- FIXED: Volume SMA (375) now EXCLUDES the current candle (Historical Baseline only)
+- Integrated Dashboard Metric Calculations (Volume * Price)
+- Live synchronization with Redis for Algo Settings
+"""
+
 import json
 import logging
-import uuid
-import sys
+import time
+import re
+import math
+from datetime import datetime as dt, date, time as datetime_time, timedelta
+from collections import defaultdict
+from typing import Optional, Any, List
+import threading
 
-from datetime import datetime as dt, timedelta
-from pytz import timezone
+import pytz
+from kiteconnect import KiteTicker
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
+import pandas as pd
+import numpy as np
 
-from kiteconnect import KiteTicker, KiteConnect
-from kiteconnect.exceptions import TokenException, InputException
+from django.conf import settings
+from trading.models import Account
+from trading.utils import get_kite, get_redis_connection, is_market_open
 
-# Assume these helpers and settings are available in your environment
-from backend.kite_utils import get_kite, get_instrument_map
-from backend.settings import KITE_TICK_MAPPING, STOCK_INDEX_MAPPING, REDIS_URL, MAX_CANDLES_TO_STORE
-from backend.redis_utils import setup_redis_client
-
-# Setup logging
 logger = logging.getLogger(__name__)
-IST = timezone('Asia/Kolkata')
-redis_client = setup_redis_client(REDIS_URL)
+IST = pytz.timezone('Asia/Kolkata')
+redis_client = get_redis_connection()
+
+# A set of F&O eligible underlying symbols - from settings or empty
+FNO_STOCKS = set(getattr(settings, 'SIMULATION_FNO_STOCKS', []))
+
+# The key used for the Redis Stream
+CANDLE_STREAM_KEY = 'candle_1m'
+
+# --- REDIS KEYS FOR SETTINGS SYNC (MATCHING FRONTEND) ---
+# These keys should be updated by your Django Views when Frontend saves settings
+KEY_GLOBAL_SETTINGS = "algo:settings:global"
+KEY_BULL_SETTINGS = "algo:settings:bull"
+KEY_BEAR_SETTINGS = "algo:settings:bear"
 
 def parse_date_safe(expiry_raw) -> Optional[date]:
     """Try multiple common expiry formats; return a date or None."""
