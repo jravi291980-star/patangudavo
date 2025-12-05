@@ -11,7 +11,11 @@ SECRET_KEY = os.environ.get('SECRET_KEY', 'django-insecure-default-key-for-local
 
 DEBUG = os.environ.get('DEBUG', 'False') == 'True'
 logger = logging.getLogger(__name__)
-ALLOWED_HOSTS = ['vaishnavi-algo-d237226d1baf.herokuapp.com', 'ionequant.live', 'www.ionequant.live']
+ALLOWED_HOSTS = [
+    'patangmaster-d0947b8eab35.herokuapp.com', 
+    'localhost', 
+    '127.0.0.1'
+]
 HEROKU_APP_NAME = os.environ.get('HEROKU_APP_NAME')
 if HEROKU_APP_NAME:
     ALLOWED_HOSTS.append(f"{HEROKU_APP_NAME}.herokuapp.com")
