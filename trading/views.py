@@ -11,6 +11,7 @@ from django.conf import settings
 from kiteconnect import KiteConnect # Import KiteConnect directly for Login flow
 from .models import Account, CashBreakoutTrade, CashBreakdownTrade
 from .utils import get_redis_connection, get_kite # Updated imports
+from django.http import HttpResponse
 
 logger = logging.getLogger(__name__)
 redis_client = get_redis_connection()
@@ -47,11 +48,12 @@ def kite_login(request):
     
     # The redirect_url should match what you set in the Kite Developer Console
     return redirect(kite.login_url())
-from django.http import HttpResponse
 
-# Add this function
+# trading/views.py
+
 def home(request):
-    return HttpResponse("<h1>Algo Trading Bot is Active</h1><p>Worker is running.</p>")
+    # This tells Django to send the 'dashboard.html' file to the user
+    return render(request, 'dashboard.html')
 @login_required
 def kite_callback(request):
     """
