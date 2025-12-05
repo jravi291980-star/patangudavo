@@ -8,8 +8,7 @@ class Account(models.Model):
     
     # --- Kite Connect Credentials ---
     api_key = models.CharField(max_length=50, blank=True, null=True)
-    api_secret = models.CharField(max_length=50, blank=True, null=True) # <--- ADD THIS LINE
-
+    api_secret = models.CharField(max_length=50, blank=True, null=True) # <--- ADDED THIS FIELD
     access_token = models.CharField(max_length=255, blank=True, null=True)
     is_master = models.BooleanField(default=False, help_text="Is this the master account for data fetching?")
 

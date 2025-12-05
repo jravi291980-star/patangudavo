@@ -6,16 +6,14 @@ from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 from django.contrib.auth.decorators import login_required
-from django.shortcuts import redirect
+from django.shortcuts import redirect, render
 from django.conf import settings
-from kiteconnect import KiteConnect # Import KiteConnect directly for Login flow
+from kiteconnect import KiteConnect
 from .models import Account, CashBreakoutTrade, CashBreakdownTrade
-from .utils import get_redis_connection, get_kite # Updated imports
-from django.http import HttpResponse
+from .utils import get_redis_connection, get_kite
 
 logger = logging.getLogger(__name__)
 redis_client = get_redis_connection()
-from django.shortcuts import render
 
 # --- REDIS KEYS ---
 KEY_ACCESS_TOKEN = "kite:access_token"
@@ -32,35 +30,22 @@ KEY_PANIC_BEAR = "algo:panic:bear"
 def get_user_account(user):
     return Account.objects.filter(user=user).first()
 
-# --- KITE AUTHENTICATION FLOW ---
+# --- VIEWS ---
+
+def home(request):
+    return render(request, 'trading/dashboard.html')
 
 @login_required
 def kite_login(request):
-    """
-    Initiates the Kite Connect login flow.
-    Redirects user to Zerodha's login page.
-    """
     account = get_user_account(request.user)
     if not account or not account.api_key:
         return JsonResponse({'error': 'Account or API Key not configured in Database'}, status=400)
 
-    # Instantiate KiteConnect directly since we don't have an access_token yet
     kite = KiteConnect(api_key=account.api_key)
-    
-    # The redirect_url should match what you set in the Kite Developer Console
     return redirect(kite.login_url())
 
-# trading/views.py
-
-def home(request):
-    # This tells Django to send the 'dashboard.html' file to the user
-    return render(request, 'trading/dashboard.html')
 @login_required
 def kite_callback(request):
-    """
-    Handles the callback from Zerodha.
-    Exchanges request_token for access_token and stores it.
-    """
     request_token = request.GET.get('request_token')
     if not request_token:
         return JsonResponse({'error': 'No request_token received'}, status=400)
@@ -70,63 +55,45 @@ def kite_callback(request):
         return JsonResponse({'error': 'Account not found'}, status=400)
 
     try:
-        # Instantiate KiteConnect directly to exchange token
         kite = KiteConnect(api_key=account.api_key)
         
-        # NOTE: Ideally, API_SECRET should be in environment variables or settings
-        api_secret = getattr(settings, 'KITE_API_SECRET', os.environ.get('KITE_API_SECRET'))
-        
-        if not api_secret:
-             logger.error("KITE_API_SECRET is missing in environment variables.")
-             return JsonResponse({'error': 'Server misconfiguration: API_SECRET missing'}, status=500)
+        # FIX: Use the secret from the Database, not environment variables
+        if not account.api_secret:
+             return JsonResponse({'error': 'API Secret not set in Dashboard'}, status=400)
 
-        data = kite.generate_session(request_token, api_secret=api_secret)
+        data = kite.generate_session(request_token, api_secret=account.api_secret)
         access_token = data['access_token']
 
-        # 1. Store in Database (Persistent)
+        # 1. Store in Database
         account.access_token = access_token
         account.save()
 
-        # 2. Store in Redis (Fast access for Engine)
+        # 2. Store in Redis
         if redis_client:
             redis_client.set(KEY_ACCESS_TOKEN, access_token)
         
         logger.info(f"Access token generated successfully for user {request.user.username}")
-        
         return redirect('/dashboard')
         
     except Exception as e:
         logger.error(f"Error generating Kite session: {e}", exc_info=True)
         return JsonResponse({'error': f"Kite Auth Failed: {str(e)}"}, status=500)
 
-
 # --- DASHBOARD API ---
 
 @login_required
 @require_http_methods(["GET"])
 def dashboard_stats(request):
-    """Returns P&L stats and Engine Status."""
     account = get_user_account(request.user)
     if not account: return JsonResponse({'error': 'No account'}, status=404)
 
     today = dt.now().date()
     
-    # Calculate P&L from DB (Closed Trades)
-    bull_pnl = 0.0
-    for t in CashBreakoutTrade.objects.filter(account=account, status='CLOSED', exit_time__date=today):
-        bull_pnl += t.pnl
-        
-    bear_pnl = 0.0
-    for t in CashBreakdownTrade.objects.filter(account=account, status='CLOSED', exit_time__date=today):
-        bear_pnl += t.pnl
+    bull_pnl = sum(t.pnl for t in CashBreakoutTrade.objects.filter(account=account, status='CLOSED', exit_time__date=today))
+    bear_pnl = sum(t.pnl for t in CashBreakdownTrade.objects.filter(account=account, status='CLOSED', exit_time__date=today))
 
-    # Fetch Engine Status from Redis
-    bull_active = "0"
-    bear_active = "0"
-    
-    if redis_client:
-        bull_active = redis_client.get(KEY_ENGINE_BULL_ENABLED) or "0"
-        bear_active = redis_client.get(KEY_ENGINE_BEAR_ENABLED) or "0"
+    bull_active = redis_client.get(KEY_ENGINE_BULL_ENABLED) or "0" if redis_client else "0"
+    bear_active = redis_client.get(KEY_ENGINE_BEAR_ENABLED) or "0" if redis_client else "0"
 
     return JsonResponse({
         'pnl': {
@@ -145,20 +112,58 @@ def dashboard_stats(request):
 @login_required
 @require_http_methods(["GET", "POST"])
 def global_settings_view(request):
-    """Get or Update Global Volume/SMA Settings."""
-    if not redis_client:
-         return JsonResponse({'error': 'Redis not available'}, status=503)
+    """
+    Handles Global Settings:
+    1. API Keys (Saved to Postgres/DB)
+    2. Global Strategy Settings (Saved to Redis)
+    """
+    # Get user account for DB operations
+    account = get_user_account(request.user)
 
     if request.method == "GET":
-        data = redis_client.get(KEY_GLOBAL_SETTINGS)
-        settings_data = json.loads(data) if data else {"volume_criteria": []}
-        return JsonResponse(settings_data)
+        # 1. Fetch Redis Data
+        redis_data = {}
+        if redis_client:
+            raw_data = redis_client.get(KEY_GLOBAL_SETTINGS)
+            if raw_data:
+                redis_data = json.loads(raw_data)
+        
+        # 2. Fetch DB Data (API Keys)
+        db_data = {
+            "api_key": account.api_key if account else "",
+            "api_secret": account.api_secret if account else "",
+        }
+
+        # Merge and return
+        return JsonResponse({**redis_data, **db_data})
     
     elif request.method == "POST":
         try:
             payload = json.loads(request.body)
-            redis_client.set(KEY_GLOBAL_SETTINGS, json.dumps(payload))
-            return JsonResponse({'status': 'updated', 'data': payload})
+            
+            # 1. SAVE TO DB (API Keys)
+            if account:
+                if 'api_key' in payload:
+                    account.api_key = payload['api_key']
+                if 'api_secret' in payload:
+                    account.api_secret = payload['api_secret']
+                account.save()
+
+            # 2. SAVE TO REDIS (Strategy Settings)
+            # Remove keys we stored in DB so we don't duplicate them in Redis needlessly
+            redis_payload = payload.copy()
+            redis_payload.pop('api_key', None)
+            redis_payload.pop('api_secret', None)
+            
+            if redis_client and redis_payload:
+                # Merge with existing redis data to prevent overwriting other fields
+                existing_data = redis_client.get(KEY_GLOBAL_SETTINGS)
+                current_settings = json.loads(existing_data) if existing_data else {}
+                current_settings.update(redis_payload)
+                
+                redis_client.set(KEY_GLOBAL_SETTINGS, json.dumps(current_settings))
+
+            return JsonResponse({'status': 'updated', 'message': 'Settings saved successfully'})
         except Exception as e:
             return JsonResponse({'error': str(e)}, status=400)
 
@@ -166,7 +171,6 @@ def global_settings_view(request):
 @login_required
 @require_http_methods(["GET", "POST"])
 def engine_settings_view(request, engine_type):
-    """Get or Update Bull/Bear Engine Settings (Risk, TSL, etc)."""
     if not redis_client:
          return JsonResponse({'error': 'Redis not available'}, status=503)
 
@@ -194,7 +198,6 @@ def engine_settings_view(request, engine_type):
 @login_required
 @require_http_methods(["POST"])
 def control_action(request):
-    """Handle Ban, Engine Toggle, and Panic Button."""
     if not redis_client:
          return JsonResponse({'error': 'Redis not available'}, status=503)
 
@@ -203,8 +206,8 @@ def control_action(request):
         action = data.get('action')
         
         if action == 'toggle_engine':
-            side = data.get('side') # 'bull' or 'bear'
-            enabled = data.get('enabled') # boolean
+            side = data.get('side')
+            enabled = data.get('enabled')
             key = KEY_ENGINE_BULL_ENABLED if side == 'bull' else KEY_ENGINE_BEAR_ENABLED
             val = "1" if enabled else "0"
             redis_client.set(key, val)
@@ -221,7 +224,7 @@ def control_action(request):
             return JsonResponse({'status': 'success', 'message': f'{symbol} unbanned'})
             
         elif action == 'panic_exit':
-            side = data.get('side') # 'bull' or 'bear'
+            side = data.get('side')
             key = KEY_PANIC_BULL if side == 'bull' else KEY_PANIC_BEAR
             redis_client.set(key, "1")
             return JsonResponse({'status': 'success', 'message': f'Panic signal sent to {side} engine'})
@@ -232,13 +235,11 @@ def control_action(request):
 @login_required
 @require_http_methods(["GET"])
 def get_orders(request):
-    """Fetch recent orders for the OrderTable component."""
     account = get_user_account(request.user)
     if not account: return JsonResponse({'bull': [], 'bear': []})
 
     today = dt.now().date()
     
-    # Fetch Bull Trades
     bull_qs = CashBreakoutTrade.objects.filter(account=account, created_at__date=today).order_by('-created_at')
     bear_qs = CashBreakdownTrade.objects.filter(account=account, created_at__date=today).order_by('-created_at')
     
@@ -265,47 +266,30 @@ def get_orders(request):
 @login_required
 @require_http_methods(["GET"])
 def get_scanner_data(request):
-    """
-    Fetch live scanner data. 
-    Returns pending trades (setups) found by Bull and Bear engines.
-    """
     account = get_user_account(request.user)
     if not account:
         return JsonResponse({'bull': [], 'bear': []})
 
     today = dt.now().date()
     
-    # Fetch Pending Bull Trades (Potential Breakouts)
-    bull_qs = CashBreakoutTrade.objects.filter(
-        account=account, 
-        status='PENDING',
-        created_at__date=today
-    ).order_by('-created_at')
-    
-    # Fetch Pending Bear Trades (Potential Breakdowns)
-    bear_qs = CashBreakdownTrade.objects.filter(
-        account=account, 
-        status='PENDING',
-        created_at__date=today
-    ).order_by('-created_at')
+    bull_qs = CashBreakoutTrade.objects.filter(account=account, status='PENDING', created_at__date=today).order_by('-created_at')
+    bear_qs = CashBreakdownTrade.objects.filter(account=account, status='PENDING', created_at__date=today).order_by('-created_at')
 
     def serialize_scan(qs, signal_label):
         data = []
         for t in qs:
-            # Calculate Candle Size %
             candle_size_pct = 0.0
             if t.candle_close > 0:
                 candle_size_pct = ((t.candle_high - t.candle_low) / t.candle_close) * 100
             
-            # Format timestamp
             ts_str = t.candle_ts.strftime('%H:%M:%S') if t.candle_ts else "--:--:--"
 
             data.append({
                 'id': t.id,
                 'symbol': t.symbol,
                 'signal_strength': signal_label,
-                'price': t.candle_close,       # Price at time of scan
-                'trigger': t.entry_level,      # Trigger Level
+                'price': t.candle_close,
+                'trigger': t.entry_level,
                 'time': ts_str,
                 'volume_price': f"{t.volume_price:.2f}Cr",
                 'candle_size': f"{candle_size_pct:.2f}%"
