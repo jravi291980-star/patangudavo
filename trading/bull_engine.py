@@ -309,7 +309,7 @@ class CashBreakoutClient:
         passed = False
         for level in global_settings.get("volume_criteria", []):
             if vol_price_cr >= float(level.get('min_vol_price_cr', 999)):
-                if vol_sma > 1000 and vol >= (vol_sma * float(level.get('sma_multiplier', 999))):
+                if vol_sma > 0 and vol >= (vol_sma * float(level.get('sma_multiplier', 999))):
                     passed = True; break
         
         if not passed: return
