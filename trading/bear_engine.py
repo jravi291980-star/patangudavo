@@ -2,7 +2,7 @@
 CashBreakdown Client (Short Sell Engine) - Final Production Version
 - Target RECALCULATED based on Actual Executed Price.
 - Fully Integrated with React Frontend Controls (Ban, Toggle, Panic).
-- Uses Tiered Risk & Global Volume settings.
+- Uses Tiered Risk & Global -ettings.
 """
 
 import json
