@@ -12,7 +12,7 @@ class Account(models.Model):
     access_token = models.CharField(max_length=255, blank=True, null=True)
     is_master = models.BooleanField(default=False, help_text="Is this the master account for data fetching?")
 
-    # --- Bull Engine Config (Synced with Dashboard) ---
+    # --- Bull Engine Config ---
     is_breakout_cash_active = models.BooleanField(default=True, verbose_name="Bull Engine Switch")
     breakout_start_time = models.TimeField(default=time(9, 15))
     breakout_end_time = models.TimeField(default=time(15, 15))
@@ -26,7 +26,10 @@ class Account(models.Model):
     breakout_risk_trade_2 = models.FloatField(default=1500.0)
     breakout_risk_trade_3 = models.FloatField(default=1000.0)
 
-    # --- Bear Engine Config (Synced with Dashboard) ---
+    # Bull Volume Settings (Separated)
+    bull_volume_settings_json = models.JSONField(default=list, blank=True, null=True, help_text="List of 10 Bull Volume Criteria Levels")
+
+    # --- Bear Engine Config ---
     is_breakdown_cash_active = models.BooleanField(default=True, verbose_name="Bear Engine Switch")
     breakdown_start_time = models.TimeField(default=time(9, 15))
     breakdown_end_time = models.TimeField(default=time(15, 15))
@@ -40,11 +43,10 @@ class Account(models.Model):
     breakdown_risk_trade_2 = models.FloatField(default=1500.0)
     breakdown_risk_trade_3 = models.FloatField(default=1000.0)
 
-    # --- Global Volume Settings (JSON for flexible criteria) ---
-    # Stores the list of 10 criteria levels
-    volume_settings_json = models.JSONField(default=dict, blank=True, null=True)
+    # Bear Volume Settings (Separated)
+    bear_volume_settings_json = models.JSONField(default=list, blank=True, null=True, help_text="List of 10 Bear Volume Criteria Levels")
 
-    # --- P&L Limits ---
+    # --- Global P&L Limits ---
     pnl_exit_enabled = models.BooleanField(default=False)
     max_daily_profit = models.FloatField(default=5000.0)
     max_daily_loss = models.FloatField(default=2000.0)
@@ -56,7 +58,6 @@ class Account(models.Model):
         return f"{self.user.username} - Account"
 
 class BaseTrade(models.Model):
-    """Abstract base class for common trade fields"""
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     account = models.ForeignKey(Account, on_delete=models.CASCADE)
     symbol = models.CharField(max_length=20)
@@ -106,14 +107,12 @@ class BaseTrade(models.Model):
 
 class CashBreakoutTrade(BaseTrade):
     prev_day_high = models.FloatField(default=0.0)
-    
     class Meta:
         verbose_name = "Bull Trade"
         ordering = ['-created_at']
 
 class CashBreakdownTrade(BaseTrade):
     prev_day_low = models.FloatField(default=0.0)
-
     class Meta:
         verbose_name = "Bear Trade"
         ordering = ['-created_at']

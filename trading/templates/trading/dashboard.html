@@ -456,7 +456,7 @@
 
             // Load Data
             const engineData = await fetchAPI(`/api/settings/engine/${side}/`);
-            const globalData = await fetchAPI('/api/settings/global/');
+            // Global data is now part of engineData return
             
             // Populate Inputs
             document.getElementById('inp-rr').value = engineData.risk_reward;
@@ -473,7 +473,7 @@
             document.getElementById('inp-pnl-enabled').checked = engineData.pnl_exit_enabled;
 
             // Render Volume Levels
-            renderVolumeInputs(globalData.volume_criteria || []);
+            renderVolumeInputs(engineData.volume_criteria || []);
 
             modal.classList.remove('hidden');
         }
@@ -518,21 +518,6 @@
         async function saveSettings() {
             if(!activeEngine) return;
 
-            const enginePayload = {
-                risk_reward: document.getElementById('inp-rr').value,
-                trailing_sl: document.getElementById('inp-tsl').value,
-                total_trades: document.getElementById('inp-max-trades').value,
-                start_time: document.getElementById('inp-start').value,
-                end_time: document.getElementById('inp-end').value,
-                trades_per_stock: document.getElementById('inp-tps').value,
-                risk_trade_1: document.getElementById('inp-r1').value,
-                risk_trade_2: document.getElementById('inp-r2').value,
-                risk_trade_3: document.getElementById('inp-r3').value,
-                max_profit: document.getElementById('inp-max-p').value,
-                max_loss: document.getElementById('inp-max-l').value,
-                pnl_exit_enabled: document.getElementById('inp-pnl-enabled').checked
-            };
-
             const vps = document.querySelectorAll('.vol-inp-vp');
             const smas = document.querySelectorAll('.vol-inp-sma');
             const avgs = document.querySelectorAll('.vol-inp-avg');
@@ -546,14 +531,25 @@
                 });
             });
 
+            const enginePayload = {
+                risk_reward: document.getElementById('inp-rr').value,
+                trailing_sl: document.getElementById('inp-tsl').value,
+                total_trades: document.getElementById('inp-max-trades').value,
+                start_time: document.getElementById('inp-start').value,
+                end_time: document.getElementById('inp-end').value,
+                trades_per_stock: document.getElementById('inp-tps').value,
+                risk_trade_1: document.getElementById('inp-r1').value,
+                risk_trade_2: document.getElementById('inp-r2').value,
+                risk_trade_3: document.getElementById('inp-r3').value,
+                max_profit: document.getElementById('inp-max-p').value,
+                max_loss: document.getElementById('inp-max-l').value,
+                pnl_exit_enabled: document.getElementById('inp-pnl-enabled').checked,
+                volume_criteria: volCriteria 
+            };
+
             await fetch(`/api/settings/engine/${activeEngine}/`, {
                 method: 'POST', headers: {'Content-Type':'application/json'},
                 body: JSON.stringify(enginePayload)
-            });
-
-            await fetch('/api/settings/global/', {
-                method: 'POST', headers: {'Content-Type':'application/json'},
-                body: JSON.stringify({ volume_criteria: volCriteria })
             });
 
             closeSettings();

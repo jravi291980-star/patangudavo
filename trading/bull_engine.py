@@ -271,8 +271,8 @@ class CashBreakoutClient:
         Checks if volume meets ANY of the 10 configured levels.
         Each level: (Vol*Price > Min) AND (Vol > SMA * Multiplier) AND (SMA > Min_SMA_Avg)
         """
-        global_settings = self._get_global_settings()
-        criteria_list = global_settings.get("volume_criteria", [])
+        settings = self._get_bull_settings()
+        criteria_list = settings.get("volume_criteria", [])
         
         # If no settings, return False (safety)
         if not criteria_list: return False

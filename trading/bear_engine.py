@@ -260,9 +260,9 @@ class CashBreakdownClient:
     
     # --- UPDATED: 10-Level Volume Logic ---
     def _check_volume_criteria(self, vol, vol_sma, vol_price_cr):
-        global_settings = self._get_global_settings()
-        criteria_list = global_settings.get("volume_criteria", [])
-        
+        settings = self._get_bear_settings()
+        criteria_list = settings.get("volume_criteria", [])
+
         if not criteria_list: return False
 
         for level in criteria_list:
