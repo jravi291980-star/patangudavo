@@ -7,8 +7,11 @@ class AccountForm(forms.ModelForm):
         fields = '__all__'
         widgets = {
             'api_key': forms.TextInput(attrs={'class': 'form-control'}),
+            'api_secret': forms.PasswordInput(attrs={'class': 'form-control', 'render_value': True}),
             'access_token': forms.TextInput(attrs={'class': 'form-control'}),
             'breakout_start_time': forms.TimeInput(attrs={'type': 'time'}),
             'breakout_end_time': forms.TimeInput(attrs={'type': 'time'}),
-            # Add widgets for other time fields as needed
+            'breakdown_start_time': forms.TimeInput(attrs={'type': 'time'}),
+            'breakdown_end_time': forms.TimeInput(attrs={'type': 'time'}),
+            'volume_settings_json': forms.Textarea(attrs={'rows': 4}),
         }

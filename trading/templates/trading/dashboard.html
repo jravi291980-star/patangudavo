@@ -5,570 +5,565 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>KiteMaster Algo Dashboard</title>
     
-    <!-- Tailwind CSS -->
+    <!-- Tailwind CSS (CDN) -->
     <script src="https://cdn.tailwindcss.com"></script>
     
-    <!-- React & ReactDOM -->
-    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-    
-    <!-- Babel (Compiles JSX in browser) -->
-    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
-    
-    <!-- Lucide Icons (Vanilla JS version) -->
+    <!-- Lucide Icons (CDN) -->
     <script src="https://unpkg.com/lucide@latest"></script>
 
     <style>
-        /* Custom scrollbar for a pro look */
-        ::-webkit-scrollbar { width: 6px; height: 6px; }
-        ::-webkit-scrollbar-track { background: #1f2937; }
-        ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
-        ::-webkit-scrollbar-thumb:hover { background: #6b7280; }
-        body { background-color: #030712; } /* Darker than gray-950 */
-        
-        /* Toast Animation */
-        @keyframes slideIn {
-            from { transform: translateY(100%); opacity: 0; }
-            to { transform: translateY(0); opacity: 1; }
+        /* CRITICAL: Force Dark Theme immediately */
+        html, body {
+            background-color: #030712 !important; /* Tailwind gray-950 */
+            color: #f3f4f6;
+            font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+            height: 100%;
         }
-        .toast-enter { animation: slideIn 0.3s ease-out forwards; }
+        /* Custom Scrollbar */
+        .custom-scrollbar::-webkit-scrollbar { width: 6px; }
+        .custom-scrollbar::-webkit-scrollbar-track { background: #1f2937; }
+        .custom-scrollbar::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+        .custom-scrollbar::-webkit-scrollbar-thumb:hover { background: #6b7280; }
+        
+        .hidden { display: none !important; }
+        
+        /* Utility classes in case Tailwind fails */
+        .flex { display: flex; }
+        .flex-col { flex-direction: column; }
+        .h-screen { height: 100vh; }
     </style>
 </head>
-<body>
-    <div id="root"></div>
+<body class="min-h-screen flex flex-col text-gray-100 bg-gray-950">
 
-    <script type="text/babel">
-        // --- SETUP GLOBALS ---
-        const { useState, useEffect, useCallback } = React;
-        const API_URL = "/api"; 
+    <!-- HEADER -->
+    <header class="bg-gray-900 border-b border-gray-800 px-3 py-1 shadow-lg flex justify-between items-center sticky top-0 z-30 h-10 w-full">
+        <div class="flex items-center gap-2">
+           <div class="w-5 h-5 bg-blue-700 rounded flex items-center justify-center font-bold text-[9px] text-white shadow-lg">KM</div>
+           <h1 class="text-xl font-bold tracking-tight text-gray-100 leading-none">Kite <span class="text-blue-500 font-light">Master</span></h1>
+        </div>
+        <div class="flex items-center gap-4 ml-auto">
+            <!-- Data Heartbeat -->
+            <div class="flex items-center gap-2 px-2 py-1 bg-gray-800 rounded border border-gray-700">
+                <div id="data-dot" class="w-2 h-2 rounded-full bg-red-500"></div>
+                <span id="data-text" class="text-[9px] font-bold uppercase text-red-400">Disconnected</span>
+            </div>
 
-        // --- ICON WRAPPER COMPONENT ---
-        const Icon = ({ name, size = 16, className = "" }) => {
-            useEffect(() => {
-                lucide.createIcons();
-            }, []);
-            return <i data-lucide={name} width={size} height={size} className={className}></i>;
-        };
-
-        const Settings = (p) => <Icon name="settings" {...p} />;
-        const Activity = (p) => <Icon name="activity" {...p} />;
-        const Target = (p) => <Icon name="target" {...p} />;
-        const TrendingUp = (p) => <Icon name="trending-up" {...p} />;
-        const TrendingDown = (p) => <Icon name="trending-down" {...p} />;
-        const ExternalLink = (p) => <Icon name="external-link" {...p} />;
-        const Ban = (p) => <Icon name="ban" {...p} />;
-        const Power = (p) => <Icon name="power" {...p} />;
-        const ShieldAlert = (p) => <Icon name="shield-alert" {...p} />;
-        const DollarSign = (p) => <Icon name="dollar-sign" {...p} />;
-        const BarChart2 = (p) => <Icon name="bar-chart-2" {...p} />;
-        const X = (p) => <Icon name="x" {...p} />;
-        const Info = (p) => <Icon name="info" {...p} />;
-        const Key = (p) => <Icon name="key" {...p} />;
-        const CheckCircle = (p) => <Icon name="check-circle" {...p} />;
-
-        // --- TOAST NOTIFICATION COMPONENT ---
-        const Toast = ({ message, type, onClose }) => {
-            useEffect(() => {
-                const timer = setTimeout(onClose, 3000);
-                return () => clearTimeout(timer);
-            }, [onClose]);
-
-            const bgClass = type === 'error' ? 'bg-red-600' : 'bg-emerald-600';
+            <div class="text-[10px] font-bold uppercase tracking-wider flex items-center gap-2 bg-gray-800 px-2 py-0.5 rounded border border-gray-700">
+                <span class="text-gray-400">Total P&L:</span>
+                <span id="total-pnl" class="text-sm text-gray-100">0.00</span>
+            </div>
             
-            return (
-                <div className={`fixed bottom-5 right-5 ${bgClass} text-white px-4 py-3 rounded shadow-lg z-50 flex items-center gap-2 toast-enter`}>
-                    {type === 'error' ? <ShieldAlert size={16}/> : <CheckCircle size={16}/>}
-                    <span className="text-xs font-bold">{message}</span>
-                </div>
-            );
-        };
+            <div class="flex items-center gap-3 text-[9px]">
+               <button onclick="window.location.href='/api/kite/login/'" class="flex items-center gap-1 text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded border border-gray-600 transition-colors font-bold uppercase tracking-wide">
+                  <i data-lucide="key" class="w-3 h-3"></i> Login Kite
+               </button>
+            </div>
+        </div>
+    </header>
 
-        // --- MAIN DASHBOARD COMPONENT ---
-        const Dashboard = () => {
-            // --- STATE ---
-            const [blacklistedStocks, setBlacklistedStocks] = useState(new Set());
-            const [isGlobalSettingsOpen, setIsGlobalSettingsOpen] = useState(false);
-            const [isCredentialsOpen, setIsCredentialsOpen] = useState(false);
-            const [isAuthPending, setIsAuthPending] = useState(false);
-            const [isConnected, setIsConnected] = useState(false);
-            const [toast, setToast] = useState(null); // { message, type }
+    <!-- SETTINGS MODAL -->
+    <div id="settings-modal" class="fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm hidden">
+        <div class="bg-gray-800 border border-emerald-600 rounded-lg shadow-2xl w-[40rem] p-5 max-h-[90vh] flex flex-col" id="modal-container">
+            <div class="flex justify-between items-center mb-4 border-b border-gray-700 pb-3 flex-shrink-0">
+                <h3 id="modal-title" class="text-sm font-bold flex items-center gap-2 text-emerald-400">
+                    <i data-lucide="settings" class="w-4 h-4"></i> Configuration
+                </h3>
+                <button onclick="closeSettings()" class="text-gray-400 hover:text-white transition-colors"><i data-lucide="x" class="w-4 h-4"></i></button>
+            </div>
             
-            // Real-time Data
-            const [pnlData, setPnlData] = useState({ bull: 0, bear: 0, total: 0 });
-            const [engineStatus, setEngineStatus] = useState({ bull: '0', bear: '0' });
-            
-            const [credentials, setCredentials] = useState({
-                apiKey: '',
-                apiSecret: '',
-                accessToken: ''
-            });
-
-            const [globalSettings, setGlobalSettings] = useState({
-                volume_criteria: [
-                    { id: 1, min_vol_price_cr: 5, sma_multiplier: 3.0 },
-                    { id: 2, min_vol_price_cr: 10, sma_multiplier: 2.0 },
-                    { id: 3, min_vol_price_cr: 25, sma_multiplier: 1.5 },
-                ]
-            });
-
-            const [bullSettings, setBullSettings] = useState({
-                risk_reward: "1:2", trailing_sl: "1:1", total_trades: 5, trades_per_stock: 3, 
-                risk_trade_1: 2000, risk_trade_2: 1500, risk_trade_3: 1000,
-                pnl_exit_enabled: false, max_profit: 5000, max_loss: 2000,
-            });
-
-            const [bearSettings, setBearSettings] = useState({
-                risk_reward: "1:2", trailing_sl: "1:1", total_trades: 5, trades_per_stock: 3,
-                risk_trade_1: 2000, risk_trade_2: 1500, risk_trade_3: 1000,
-                pnl_exit_enabled: false, max_profit: 5000, max_loss: 2000,
-            });
-
-            const [bullOrders, setBullOrders] = useState([]);
-            const [bearOrders, setBearOrders] = useState([]);
-            const [bullScanner, setBullScanner] = useState([]);
-            const [bearScanner, setBearScanner] = useState([]);
-
-            // --- HELPER FUNCTIONS ---
-            const showToast = (msg, type = 'success') => setToast({ message: msg, type });
-
-            // --- API INTERACTION ---
-            const apiCall = async (endpoint, method = 'GET', body = null) => {
-                try {
-                    const options = {
-                        method,
-                        headers: { 'Content-Type': 'application/json' },
-                    };
-                    if (body) options.body = JSON.stringify(body);
-                    const res = await fetch(endpoint, options);
-                    const data = await res.json();
-                    if (!res.ok) throw new Error(data.message || data.error || 'Request failed');
-                    return data;
-                } catch (err) {
-                    console.error(`API Error (${endpoint}):`, err);
-                    showToast(err.message, 'error');
-                    return null;
-                }
-            };
-
-            // --- DATA LOADING ---
-            const fetchAllData = useCallback(async () => {
-                // 1. Stats & PnL
-                const stats = await apiCall(`${API_URL}/stats/`);
-                if (stats) {
-                    setPnlData(stats.pnl);
-                    setEngineStatus(stats.engine_status);
-                }
-
-                // 2. Orders
-                const orders = await apiCall(`${API_URL}/orders/`);
-                if (orders) {
-                    setBullOrders(orders.bull);
-                    setBearOrders(orders.bear);
-                }
-
-                // 3. Scanner
-                const scan = await apiCall(`${API_URL}/scanner/`);
-                if (scan) {
-                    setBullScanner(scan.bull);
-                    setBearScanner(scan.bear);
-                }
-            }, []);
-
-            const loadSettings = useCallback(async () => {
-                // 1. Global Settings (API Keys & Vol Criteria)
-                const global = await apiCall(`${API_URL}/settings/global/`);
-                if (global) {
-                    setCredentials({ 
-                        apiKey: global.api_key || '', 
-                        apiSecret: global.api_secret || '',
-                        accessToken: '' 
-                    });
-                    if (global.volume_criteria) {
-                        setGlobalSettings(prev => ({ ...prev, volume_criteria: global.volume_criteria }));
-                    }
-                    if (global.api_key && global.api_secret) setIsConnected(true); // Basic check
-                }
-
-                // 2. Engine Settings
-                const bull = await apiCall(`${API_URL}/settings/engine/bull/`);
-                if (bull) setBullSettings(prev => ({...prev, ...bull}));
-
-                const bear = await apiCall(`${API_URL}/settings/engine/bear/`);
-                if (bear) setBearSettings(prev => ({...prev, ...bear}));
-
-            }, []);
-
-            // Initial Load
-            useEffect(() => {
-                loadSettings();
-                fetchAllData();
-                const interval = setInterval(fetchAllData, 3000); // Poll every 3s
-                setTimeout(() => lucide.createIcons(), 100);
-                return () => clearInterval(interval);
-            }, [fetchAllData, loadSettings]);
-
-            // Re-render icons on updates
-            useEffect(() => {
-                lucide.createIcons();
-            });
-
-            // --- ACTIONS ---
-            const initiateKiteLogin = () => { window.location.href = `${API_URL}/kite/login/`; };
-
-            // SAVE CREDENTIALS
-            const saveCredentials = async () => {
-                const payload = { api_key: credentials.apiKey, api_secret: credentials.apiSecret };
-                const res = await apiCall(`${API_URL}/settings/global/`, 'POST', payload);
-                if (res) {
-                    showToast("Credentials Saved Successfully");
-                    setIsCredentialsOpen(false);
-                }
-            };
-
-            // SAVE GLOBAL CRITERIA (Volume/SMA)
-            const saveGlobalCriteria = async () => {
-                const payload = { volume_criteria: globalSettings.volume_criteria };
-                const res = await apiCall(`${API_URL}/settings/global/`, 'POST', payload);
-                if (res) {
-                    showToast("Global Criteria Updated");
-                    setIsGlobalSettingsOpen(false);
-                }
-            };
-
-            // UPDATE STATE FOR GLOBAL SETTINGS
-            const updateGlobalSetting = (index, field, value) => {
-                const newCriteria = [...globalSettings.volume_criteria];
-                newCriteria[index][field] = parseFloat(value);
-                setGlobalSettings({ ...globalSettings, volume_criteria: newCriteria });
-            };
-
-            // TOGGLE ENGINE
-            const toggleEngine = async (side, enabled) => {
-                // Optimistic Update
-                setEngineStatus(prev => ({ ...prev, [side]: enabled ? '1' : '0' }));
-                
-                const res = await apiCall(`${API_URL}/control/`, 'POST', {
-                    action: 'toggle_engine',
-                    side: side,
-                    enabled: enabled
-                });
-                
-                if (res) showToast(`${side.toUpperCase()} Engine ${enabled ? 'Started' : 'Stopped'}`);
-                else setEngineStatus(prev => ({ ...prev, [side]: !enabled ? '1' : '0' })); // Revert on fail
-            };
-
-            // UPDATE ENGINE SETTINGS (Risk, Max Profit etc)
-            const handleEngineUpdate = async (side) => {
-                const settings = side === 'bull' ? bullSettings : bearSettings;
-                const res = await apiCall(`${API_URL}/settings/engine/${side}/`, 'POST', settings);
-                if (res) showToast(`${side.toUpperCase()} Settings Saved`);
-            };
-
-            // PANIC EXIT
-            const panicExit = async (side) => {
-                if(window.confirm(`⚠️ CRITICAL: PANIC EXIT ${side.toUpperCase()}? This will close all open positions immediately.`)) {
-                    const res = await apiCall(`${API_URL}/control/`, 'POST', { action: 'panic_exit', side });
-                    if(res) showToast(`Panic Signal Sent to ${side.toUpperCase()}`);
-                }
-            };
-
-            const toggleStopStock = async (symbol) => {
-                // Assuming ban_symbol API exists or local logic
-                // Here simply adding to blacklist locally, API would be better
-                const isBanned = blacklistedStocks.has(symbol);
-                const action = isBanned ? 'unban_symbol' : 'ban_symbol';
-                
-                const res = await apiCall(`${API_URL}/control/`, 'POST', { action, symbol });
-                
-                if (res) {
-                    const newSet = new Set(blacklistedStocks);
-                    if (isBanned) newSet.delete(symbol);
-                    else newSet.add(symbol);
-                    setBlacklistedStocks(newSet);
-                    showToast(`${symbol} ${isBanned ? 'Unbanned' : 'Banned'}`);
-                }
-            };
-
-            const openChart = (symbol) => {
-                window.open(`https://in.tradingview.com/chart/?symbol=NSE:${symbol}`, '_blank');
-            };
-
-            // --- DERIVED STATE ---
-            const totalGlobalPnL = pnlData.total || (pnlData.bull + pnlData.bear);
-            
-            const getSentimentStats = () => {
-                const bullCount = bullScanner.length;
-                const bearCount = bearScanner.length;
-                const total = bullCount + bearCount;
-                if (total === 0) return { percentage: 0, isBullish: true, bullCount: 0, bearCount: 0 };
-                const percentage = Math.round(((bullCount - bearCount) / total) * 100);
-                return { percentage, isBullish: percentage >= 0, bullCount, bearCount };
-            };
-            const sentiment = getSentimentStats();
-
-            // --- SUB-COMPONENTS ---
-            const EngineSettings = ({ settings, setSettings, side }) => {
-                const engineEnabled = engineStatus[side] === '1';
-                return (
-                <div className="bg-gray-800 p-2 rounded-lg shadow-md border border-gray-700 mb-2">
-                    <div className="flex items-center justify-between mb-1.5 border-b border-gray-700 pb-1">
-                    <div className="flex items-center gap-1.5">
-                        <Settings size={14} className="text-gray-400" />
-                        <h3 className="font-bold text-gray-200 text-[10px]">Engine Config</h3>
+            <div class="flex-1 overflow-y-auto pr-2 custom-scrollbar">
+                <!-- Engine Specific Config -->
+                <div class="bg-gray-800 p-3 rounded-lg border border-gray-700 mb-4">
+                    <h3 class="font-bold text-gray-200 text-xs uppercase tracking-wide mb-2">Strategy Risk Config</h3>
+                    <!-- Form Fields -->
+                    <div class="grid grid-cols-5 gap-2 mb-2">
+                        <div><label class="block text-[9px] font-bold text-gray-400">Risk:Reward</label><input id="inp-rr" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
+                        <div><label class="block text-[9px] font-bold text-gray-400">Trailing SL</label><input id="inp-tsl" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
+                        <div><label class="block text-[9px] font-bold text-gray-400">Max Trades</label><input id="inp-max-trades" type="number" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
+                        <div><label class="block text-[9px] font-bold text-gray-400">Start</label><input id="inp-start" type="time" class="w-full bg-gray-900 border border-gray-600 rounded px-1 h-6 text-[10px] font-bold text-gray-100"></div>
+                        <div><label class="block text-[9px] font-bold text-gray-400">End</label><input id="inp-end" type="time" class="w-full bg-gray-900 border border-gray-600 rounded px-1 h-6 text-[10px] font-bold text-gray-100"></div>
                     </div>
-                    <div className="flex items-center gap-2">
-                        <span className={`text-[10px] font-bold uppercase ${engineEnabled ? 'text-emerald-400' : 'text-rose-400'}`}>{engineEnabled ? 'Running' : 'Stopped'}</span>
-                        <button 
-                            onClick={() => toggleEngine(side, !engineEnabled)} 
-                            className={`w-5 h-2.5 rounded-full flex items-center transition-colors px-0.5 ${engineEnabled ? (side === 'bull' ? 'bg-emerald-500' : 'bg-rose-500') : 'bg-gray-600'}`}
-                        >
-                            <div className={`w-1.5 h-1.5 bg-white rounded-full shadow-md transform transition-transform ${engineEnabled ? 'translate-x-2.5' : 'translate-x-0'}`}></div>
-                        </button>
+                    <!-- Tiered Risk -->
+                    <div class="grid grid-cols-4 gap-2 mb-3 bg-gray-900/30 p-1.5 rounded border border-gray-700/50">
+                        <div><label class="block text-[9px] font-bold text-blue-400">Entries/Stock</label><input id="inp-tps" type="number" class="w-full bg-gray-900 border border-blue-900 rounded px-2 h-6 text-xs font-bold text-blue-100"></div>
+                        <div><label class="block text-[9px] font-bold text-gray-500">Risk (1st)</label><input id="inp-r1" type="number" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
+                        <div><label class="block text-[9px] font-bold text-gray-500">Risk (2nd)</label><input id="inp-r2" type="number" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
+                        <div><label class="block text-[9px] font-bold text-gray-500">Risk (3rd)</label><input id="inp-r3" type="number" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
                     </div>
-                    </div>
-                    
-                    <div className="grid grid-cols-4 gap-1.5 mb-2">
-                    <div>
-                        <label className="block text-gray-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Risk:Rew</label>
-                        <input type="text" value={settings.risk_reward} onChange={(e) => setSettings({...settings, risk_reward: e.target.value})} className="w-full border border-gray-600 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-gray-100" />
-                    </div>
-                    <div>
-                        <label className="block text-gray-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Trail SL</label>
-                        <input type="text" value={settings.trailing_sl} onChange={(e) => setSettings({...settings, trailing_sl: e.target.value})} className="w-full border border-gray-600 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-gray-100" />
-                    </div>
-                    <div>
-                        <label className="block text-gray-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Max Trds</label>
-                        <input type="number" value={settings.total_trades} onChange={(e) => setSettings({...settings, total_trades: e.target.value})} className="w-full border border-gray-600 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-gray-100" />
-                    </div>
-                    <div>
-                        <label className="block text-blue-300 mb-0 whitespace-nowrap text-[10px] font-bold text-left">Ent/Stk</label>
-                        <input type="number" value={settings.trades_per_stock} onChange={(e) => setSettings({...settings, trades_per_stock: e.target.value})} className="w-full border border-blue-900 rounded px-1 py-0 h-5 text-[10px] font-bold focus:outline-none focus:border-blue-500 bg-gray-700 text-blue-100" />
-                    </div>
-                    </div>
-
-                    <div className="mb-2 bg-gray-750 p-1 rounded border border-gray-600">
-                        <div className="grid grid-cols-3 gap-1.5">
-                        {[1, 2, 3].map(i => (
-                            <div key={i} className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5">
-                            <span className="text-gray-400 text-[13px] font-bold mr-1.5 flex-shrink-0">{i === 1 ? '1st' : i === 2 ? '2nd' : '3rd'}</span>
-                            <input type="number" value={settings[`risk_trade_${i}`]} onChange={(e) => setSettings({...settings, [`risk_trade_${i}`]: parseFloat(e.target.value)})} className="bg-transparent w-full text-[13px] font-bold text-gray-100 focus:outline-none" />
-                            </div>
-                        ))}
+                    <!-- P&L -->
+                    <div id="pnl-container" class="p-2 rounded border bg-gray-750 border-gray-700 flex items-center justify-between gap-3">
+                        <div class="flex items-center gap-1.5 text-[10px] font-bold text-gray-300">Global P&L Exit</div>
+                        <div class="flex items-center gap-2 flex-1">
+                            <input id="inp-max-p" type="number" placeholder="Max Profit" class="bg-gray-800 border border-gray-600 rounded h-7 px-2 w-full text-xs font-bold text-green-400">
+                            <input id="inp-max-l" type="number" placeholder="Max Loss" class="bg-gray-800 border border-gray-600 rounded h-7 px-2 w-full text-xs font-bold text-red-400">
                         </div>
+                        <input type="checkbox" id="inp-pnl-enabled" class="w-4 h-4">
                     </div>
-
-                    <div className={`p-1.5 rounded border flex items-center justify-between gap-2 h-7 ${settings.pnl_exit_enabled ? (side === 'bull' ? 'bg-emerald-900/20 border-emerald-800' : 'bg-rose-900/20 border-rose-800') : 'bg-gray-750 border-gray-700'}`}>
-                    <div className="flex items-center gap-1 text-[9px] font-bold text-gray-300 whitespace-nowrap pl-1">
-                        <DollarSign size={10} /> P&L Exit
-                    </div>
-                    <div className="flex items-center gap-1.5 flex-1">
-                        <div className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5 flex-1">
-                            <span className="text-gray-400 text-[8px] font-bold mr-1 flex-shrink-0">Tgt</span>
-                            <input type="number" value={settings.max_profit} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_profit: parseFloat(e.target.value)})} className="bg-transparent w-full text-[13px] font-bold text-green-400 focus:outline-none min-w-0" />
-                        </div>
-                        <div className="flex items-center border border-gray-600 rounded bg-gray-800 h-5 px-1.5 flex-1">
-                            <span className="text-gray-400 text-[8px] font-bold mr-1 flex-shrink-0">Loss</span>
-                            <input type="number" value={settings.max_loss} disabled={!settings.pnl_exit_enabled} onChange={(e) => setSettings({...settings, max_loss: parseFloat(e.target.value)})} className="bg-transparent w-full text-[13px] font-bold text-red-400 focus:outline-none min-w-0" />
-                        </div>
-                    </div>
-                    <div className="flex items-center pr-1">
-                        <button onClick={() => setSettings({...settings, pnl_exit_enabled: !settings.pnl_exit_enabled})} className={`w-5 h-2.5 rounded-full flex items-center transition-colors px-0.5 ${settings.pnl_exit_enabled ? (side === 'bull' ? 'bg-emerald-500' : 'bg-rose-500') : 'bg-gray-600'}`}>
-                            <div className={`w-1.5 h-1.5 bg-white rounded-full shadow-md transform transition-transform ${settings.pnl_exit_enabled ? 'translate-x-2.5' : 'translate-x-0'}`}></div>
-                        </button>
-                    </div>
-                    </div>
-                    <button onClick={() => handleEngineUpdate(side)} className={`w-full mt-2 py-1 rounded text-white text-[10px] font-bold transition-colors uppercase tracking-wide ${side === 'bull' ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-rose-700 hover:bg-rose-600'}`}>Update</button>
                 </div>
-                )};
 
-            const OrderTable = ({ orders }) => (
-                <div className="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
-                <div className="flex items-center gap-2 mb-3 border-b border-gray-700 pb-2">
-                    <Activity size={16} className="text-gray-400" />
-                    <h3 className="font-semibold text-gray-200 text-sm">Executed Orders</h3>
-                    <span className="ml-auto bg-gray-700 text-gray-300 text-[10px] px-2 py-0.5 rounded-full border border-gray-600">{orders.length} Orders</span>
+                <div class="h-px bg-gray-700 my-4"></div>
+
+                <!-- VOLUME 10 LEVELS -->
+                <div class="flex items-center gap-2 mb-3">
+                    <i data-lucide="sliders" class="w-3 h-3 text-gray-400"></i>
+                    <h3 class="font-bold text-gray-200 text-xs uppercase tracking-wide">Volume SMA Criteria (10 Levels)</h3>
                 </div>
-                <div className="overflow-x-auto flex-1">
-                    <table className="w-full text-xs text-left text-gray-300">
-                    <thead className="bg-gray-900 text-gray-400 font-medium uppercase">
-                        <tr>
-                        <th className="px-2 py-2">Stock</th>
-                        <th className="px-2 py-2">Entry</th>
-                        <th className="px-2 py-2">Tgt/SL</th>
-                        <th className="px-2 py-2">P&L</th>
-                        <th className="px-2 py-2 text-right">Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody className="divide-y divide-gray-700">
-                        {orders.map(order => {
-                        const isBlocked = blacklistedStocks.has(order.symbol);
-                        return (
-                        <tr key={order.id} className={`hover:bg-gray-750 transition-colors ${isBlocked ? 'opacity-50' : ''}`}>
-                            <td className="px-2 py-3">
-                            <div className={`font-bold text-sm ${isBlocked ? 'line-through text-red-400' : 'text-gray-100'}`}>
-                                {order.symbol} 
-                                {order.trade_count > 1 && <span className="ml-1 text-[9px] bg-gray-700 px-1 rounded text-gray-300">#{order.trade_count}</span>}
-                            </div>
-                            <button onClick={() => openChart(order.symbol)} className="text-[10px] text-blue-400 hover:text-blue-300 flex items-center gap-0.5 mt-0.5">Chart <ExternalLink size={8} /></button>
-                            </td>
-                            <td className="px-2 py-3 font-mono text-gray-300">{order.entry}</td>
-                            <td className="px-2 py-3"><div className="text-green-400 font-medium">{order.target}</div><div className="text-red-400 font-medium">{order.sl}</div></td>
-                            <td className="px-2 py-3"><span className={`font-mono font-bold ${order.pnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>{order.pnl > 0 ? '+' : ''}{order.pnl}</span><div className={`mt-0.5 text-[9px] uppercase font-bold tracking-wider ${order.status === 'OPEN' ? 'text-blue-300' : 'text-gray-500'}`}>{order.status}</div></td>
-                            <td className="px-2 py-3 text-right">
-                            <div className="flex justify-end gap-2">
-                                <button onClick={() => toggleStopStock(order.symbol)} className={`p-1.5 rounded border transition-colors ${isBlocked ? 'bg-red-900/20 border-red-800 text-red-500' : 'bg-gray-700 border-gray-600 text-gray-400'}`}><Ban size={12} /></button>
-                                {order.status === 'OPEN' && (<button className="bg-red-900/80 text-red-100 hover:bg-red-700 transition-colors px-2 py-1 rounded border border-red-700 text-[10px] font-bold uppercase" onClick={() => panicExit('single')}>Exit</button>)}
-                            </div>
-                            </td>
-                        </tr>
-                        )})}
-                    </tbody>
+                
+                <div id="volume-levels-container" class="space-y-1">
+                    <!-- Javascript will inject 10 rows here -->
+                </div>
+            </div>
+
+            <div class="pt-4 mt-2 border-t border-gray-700 flex-shrink-0">
+                <button onclick="saveSettings()" id="btn-save-settings" class="w-full text-white text-xs font-bold py-2.5 rounded transition-colors uppercase tracking-wider shadow-lg bg-emerald-600 hover:bg-emerald-700">
+                    Save Configuration
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- MAIN GRID -->
+    <main class="p-4 grid grid-cols-2 gap-4 flex-1 items-start w-full">
+        
+        <!-- BULL SECTION -->
+        <section class="flex flex-col bg-gray-900 p-3 rounded-xl border-t-4 border-emerald-600 shadow-xl min-h-full">
+            <div class="flex items-center gap-2 mb-2 text-emerald-100 bg-emerald-900/20 p-1.5 rounded-lg border border-emerald-800/30">
+                <i data-lucide="trending-up" class="w-4 h-4 text-emerald-400"></i>
+                <h2 class="text-[10px] font-bold uppercase tracking-wider flex-1 flex items-center gap-2">
+                    BULL P&L: <span id="bull-pnl" class="text-sm text-emerald-400">0.00</span>
+                </h2>
+                <!-- Bull Controls -->
+                <button onclick="toggleEngine('bull')" id="btn-bull-toggle" class="w-8 h-4 rounded-full flex items-center bg-emerald-500 px-0.5 mx-2 transition-colors">
+                    <div id="dot-bull-toggle" class="w-3 h-3 bg-white rounded-full shadow-md transform translate-x-4 transition-transform"></div>
+                </button>
+                <button onclick="openSettings('bull')" class="bg-gray-800 hover:bg-gray-700 text-gray-200 text-[9px] font-bold uppercase px-2 py-1 rounded border border-gray-600">Config</button>
+                <button onclick="panicExit('bull')" class="bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold uppercase px-1.5 py-1 rounded border border-red-500">EXIT ALL</button>
+            </div>
+
+            <!-- Bull Order Table -->
+            <div class="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
+                <div class="flex items-center justify-between mb-2 border-b border-gray-700 pb-2">
+                    <h3 class="font-semibold text-gray-200 text-sm flex gap-2"><i data-lucide="activity" class="w-4 h-4 text-gray-400"></i> Executed Orders</h3>
+                    <span id="bull-order-count" class="bg-gray-700 text-gray-300 text-[10px] px-2 rounded-full">0</span>
+                </div>
+                <div class="overflow-x-auto flex-1">
+                    <table class="w-full text-xs text-left text-gray-300">
+                        <thead class="bg-gray-900 text-gray-400 font-medium uppercase">
+                            <tr><th class="px-2 py-2">Stock</th><th class="px-2 py-2">Entry</th><th class="px-2 py-2">Tgt/SL</th><th class="px-2 py-2">P&L</th><th class="px-2 py-2 text-right">Act</th></tr>
+                        </thead>
+                        <tbody id="bull-orders-tbody" class="divide-y divide-gray-700"></tbody>
                     </table>
                 </div>
-                </div>
-            );
+            </div>
 
-            const ScannerList = ({ scannerData }) => (
-                <div className="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
-                <div className="flex items-center gap-2 mb-3 border-b border-gray-700 pb-2">
-                    <Target size={16} className="text-gray-400" />
-                    <h3 className="font-semibold text-gray-200 text-sm">Scanner (1 Min Breakout)</h3>
-                    <span className="ml-auto bg-gray-700 text-gray-300 text-[10px] px-2 py-0.5 rounded-full border border-gray-600">{scannerData.length}</span>
+            <!-- Bull Scanner -->
+            <div class="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
+                <div class="flex items-center justify-between mb-2 border-b border-gray-700 pb-2">
+                    <h3 class="font-semibold text-gray-200 text-sm flex gap-2"><i data-lucide="target" class="w-4 h-4 text-gray-400"></i> Scanner</h3>
+                    <span id="bull-scan-count" class="bg-gray-700 text-gray-300 text-[10px] px-2 rounded-full">0</span>
                 </div>
-                <div className="space-y-1 flex-1 overflow-y-auto">
-                    {scannerData.map((item) => {
-                    const isBlocked = blacklistedStocks.has(item.symbol);
-                    return (
-                    <div key={item.id} className={`flex items-center gap-2 p-2 rounded bg-gray-750 border border-gray-700 transition-all ${isBlocked ? 'opacity-50 grayscale' : 'hover:border-blue-500/50 hover:bg-gray-700'}`}>
-                        <div className={`font-bold text-xs w-20 flex items-center gap-1 ${isBlocked ? 'line-through text-gray-500' : 'text-gray-200'}`}>{item.symbol}<button onClick={() => openChart(item.symbol)} className="text-gray-500 hover:text-blue-400"><ExternalLink size={10} /></button></div>
-                        <div className="text-[10px] text-gray-400 font-mono w-16">{item.time}</div>
-                        <div className={`text-[10px] font-bold uppercase w-16 truncate ${item.signal_strength.includes('Breakout') ? 'text-green-400' : 'text-red-400'}`}>{item.signal_strength}</div>
-                        <div className="flex items-center gap-1 text-[10px]"><span className="text-gray-500">VP:</span><span className="font-extrabold text-amber-300">{item.volume_price}</span></div>
-                        <div className="flex items-center gap-1 text-[10px]"><span className="text-gray-500">Sz:</span><span className="font-extrabold text-cyan-300">{item.candle_size}</span></div>
-                        <div className="ml-auto font-mono font-bold text-gray-300 text-xs">₹{item.price}</div>
-                        <button onClick={() => toggleStopStock(item.symbol)} className={`p-1 rounded-full flex-shrink-0 transition-colors ml-2 ${isBlocked ? 'text-red-500 bg-red-900/20' : 'text-gray-500 hover:text-red-400 hover:bg-gray-600'}`}><Ban size={14} /></button>
-                    </div>
-                    )})}
-                </div>
-                </div>
-            );
+                <div id="bull-scanner-list" class="space-y-1 flex-1 overflow-y-auto max-h-[300px] custom-scrollbar"></div>
+            </div>
+        </section>
 
-            // --- RENDER ---
-            return (
-                <div className="min-h-screen bg-gray-950 font-sans flex flex-col text-gray-100">
-                {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
+        <!-- BEAR SECTION -->
+        <section class="flex flex-col bg-gray-900 p-3 rounded-xl border-t-4 border-rose-600 shadow-xl min-h-full">
+            <div class="flex items-center gap-2 mb-2 text-rose-100 bg-rose-900/20 p-1.5 rounded-lg border border-rose-800/30">
+                <i data-lucide="trending-down" class="w-4 h-4 text-rose-400"></i>
+                <h2 class="text-[10px] font-bold uppercase tracking-wider flex-1 flex items-center gap-2">
+                    BEAR P&L: <span id="bear-pnl" class="text-sm text-rose-400">0.00</span>
+                </h2>
+                <!-- Bear Controls -->
+                <button onclick="toggleEngine('bear')" id="btn-bear-toggle" class="w-8 h-4 rounded-full flex items-center bg-rose-500 px-0.5 mx-2 transition-colors">
+                    <div id="dot-bear-toggle" class="w-3 h-3 bg-white rounded-full shadow-md transform translate-x-4 transition-transform"></div>
+                </button>
+                <button onclick="openSettings('bear')" class="bg-gray-800 hover:bg-gray-700 text-gray-200 text-[9px] font-bold uppercase px-2 py-1 rounded border border-gray-600">Config</button>
+                <button onclick="panicExit('bear')" class="bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold uppercase px-1.5 py-1 rounded border border-red-500">EXIT ALL</button>
+            </div>
+
+            <!-- Bear Order Table -->
+            <div class="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
+                <div class="flex items-center justify-between mb-2 border-b border-gray-700 pb-2">
+                    <h3 class="font-semibold text-gray-200 text-sm flex gap-2"><i data-lucide="activity" class="w-4 h-4 text-gray-400"></i> Executed Orders</h3>
+                    <span id="bear-order-count" class="bg-gray-700 text-gray-300 text-[10px] px-2 rounded-full">0</span>
+                </div>
+                <div class="overflow-x-auto flex-1">
+                    <table class="w-full text-xs text-left text-gray-300">
+                        <thead class="bg-gray-900 text-gray-400 font-medium uppercase">
+                            <tr><th class="px-2 py-2">Stock</th><th class="px-2 py-2">Entry</th><th class="px-2 py-2">Tgt/SL</th><th class="px-2 py-2">P&L</th><th class="px-2 py-2 text-right">Act</th></tr>
+                        </thead>
+                        <tbody id="bear-orders-tbody" class="divide-y divide-gray-700"></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Bear Scanner -->
+            <div class="bg-gray-800 p-3 rounded-lg shadow-md border border-gray-700 mb-3 min-h-[300px] flex flex-col">
+                <div class="flex items-center justify-between mb-2 border-b border-gray-700 pb-2">
+                    <h3 class="font-semibold text-gray-200 text-sm flex gap-2"><i data-lucide="target" class="w-4 h-4 text-gray-400"></i> Scanner</h3>
+                    <span id="bear-scan-count" class="bg-gray-700 text-gray-300 text-[10px] px-2 rounded-full">0</span>
+                </div>
+                <div id="bear-scanner-list" class="space-y-1 flex-1 overflow-y-auto max-h-[300px] custom-scrollbar"></div>
+            </div>
+        </section>
+    </main>
+
+    <!-- JAVASCRIPT LOGIC -->
+    <script>
+        // Initialize Icons
+        if(window.lucide) lucide.createIcons();
+
+        // State
+        let activeEngine = null; // 'bull' or 'bear'
+        let engineStatus = { bull: true, bear: true };
+        let volumeCriteria = [];
+        let blacklisted = new Set();
+
+        // --- API HELPERS (WITH MOCK FALLBACK) ---
+        async function fetchAPI(url, options = {}) {
+            try {
+                // Try real fetch first
+                const res = await fetch(url, options);
+                if(!res.ok) throw new Error(res.statusText);
+                return await res.json();
+            } catch (e) { 
+                console.warn("API Error, using mock data for preview:", e); 
+                return getMockData(url); 
+            }
+        }
+
+        async function postAPI(action, payload) {
+            console.log(`[ACTION] ${action}`, payload);
+            return await fetchAPI('/api/control/', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ action, ...payload })
+            });
+        }
+
+        // --- MOCK DATA FOR PREVIEW MODE ---
+        function getMockData(url) {
+            if(url.includes('/api/stats')) {
+                return {
+                    pnl: { total: 1250.50, bull: 1500.00, bear: -249.50 },
+                    engine_status: { bull: engineStatus.bull?"1":"0", bear: engineStatus.bear?"1":"0" },
+                    data_connected: true
+                };
+            }
+            if(url.includes('/api/orders')) {
+                return {
+                    bull: [{id:1, symbol:'RELIANCE', entry:2450, target:2500, sl:2430, status:'OPEN', pnl:1500, quantity:50}],
+                    bear: [{id:2, symbol:'ADANIENT', entry:3200, target:3150, sl:3220, status:'CLOSED', pnl:-249.50, quantity:25}]
+                };
+            }
+            if(url.includes('/api/scanner')) {
+                return {
+                    bull: [{id:101, symbol:'INFY', signal_strength:'Breakout', price:1420, time:'09:30', volume_price:'12Cr', candle_size:'0.5%', status:'PENDING'}],
+                    bear: []
+                };
+            }
+            if(url.includes('/settings')) {
+                return {
+                    risk_reward: '1:2', trailing_sl: '1:1', total_trades: 5,
+                    start_time: '09:15', end_time: '15:15', trades_per_stock: 2,
+                    risk_trade_1: 2000, risk_trade_2: 1500, risk_trade_3: 1000,
+                    max_profit: 5000, max_loss: 2000, pnl_exit_enabled: false,
+                    volume_criteria: Array.from({length:10}, (_,i)=>({min_vol_price_cr:(i+1)*5, sma_multiplier:2.0, min_sma_avg:50000}))
+                };
+            }
+            return {};
+        }
+
+        // --- DASHBOARD UPDATES ---
+        async function updateDashboard() {
+            // 1. Stats & P&L
+            const stats = await fetchAPI('/api/stats/');
+            if (stats) {
+                // Update P&L Texts
+                const totalPnl = stats.pnl ? stats.pnl.total : 0;
+                document.getElementById('total-pnl').innerText = (totalPnl > 0 ? '+' : '') + totalPnl.toFixed(2);
+                document.getElementById('total-pnl').className = `text-sm ${totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`;
                 
-                <header className="bg-gray-900 border-b border-gray-800 px-3 py-1 shadow-lg flex justify-between items-center sticky top-0 z-30 h-10">
-                    <div className="flex items-center gap-2">
-                        <div className="w-5 h-5 bg-blue-700 rounded flex items-center justify-center font-bold text-[9px] text-white shadow-lg">KM</div>
-                        <h1 className="text-xl font-bold tracking-tight text-gray-100 leading-none">Kite <span className="text-blue-500 font-light">Master</span></h1>
-                    </div>
-                    <div className="flex items-center gap-4 ml-auto">
-                        <div className="text-[10px] font-bold uppercase tracking-wider flex items-center gap-2 bg-gray-800 px-2 py-0.5 rounded border border-gray-700">
-                            <span className="text-gray-400">Total P&L:</span>
-                            <span className={`text-sm ${totalGlobalPnL >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{totalGlobalPnL > 0 ? '+' : ''}{totalGlobalPnL}</span>
-                        </div>
-                        <div className={`flex items-center gap-2 px-3 py-0.5 rounded border ${sentiment.isBullish ? 'bg-emerald-950/20 border-emerald-500/20' : 'bg-rose-950/20 border-rose-500/20'}`}>
-                            <div className="flex items-center gap-1"><BarChart2 size={14} className={sentiment.isBullish ? 'text-emerald-400' : 'text-rose-400'} /><span className={`text-sm font-black tracking-tight ${sentiment.isBullish ? 'text-emerald-400' : 'text-rose-400'}`}>{sentiment.percentage > 0 ? '+' : ''}{sentiment.percentage}%</span></div>
-                            <div className="h-4 w-px bg-gray-700"></div>
-                            <div className="text-[10px] font-mono font-bold text-gray-400 flex gap-2"><span>BULL: <span className="text-emerald-400">{sentiment.bullCount}</span></span><span>BEAR: <span className="text-rose-400">{sentiment.bearCount}</span></span></div>
-                        </div>
-                        <div className="flex items-center gap-3 text-[9px]">
-                            {/* CREDENTIALS BUTTON */}
-                            <button onClick={() => setIsCredentialsOpen(true)} className="text-gray-400 hover:text-blue-400 transition-colors p-1 rounded hover:bg-gray-800" title="API Credentials"><Key size={14} /></button>
-                            
-                            <button onClick={() => setIsGlobalSettingsOpen(true)} className="text-gray-400 hover:text-blue-400 transition-colors p-1 rounded hover:bg-gray-800" title="Global Settings"><Settings size={14} /></button>
-                            <span className={`flex items-center gap-1 font-medium px-1.5 py-0.5 rounded border ${isConnected ? 'text-emerald-400 bg-emerald-900/20 border-emerald-900/50' : 'text-red-400 bg-red-900/20 border-red-900/50'}`}>
-                                <div className={`w-1 h-1 rounded-full ${isConnected ? 'bg-emerald-500' : 'bg-red-500'} animate-pulse`}></div> {isConnected ? 'System Ready' : 'API Missing'}
-                            </span>
-                            <span className="text-gray-400 border-l border-gray-700 pl-2 hidden md:inline">Master Super User</span>
-                        </div>
-                    </div>
-                </header>
+                if(stats.pnl) {
+                    document.getElementById('bull-pnl').innerText = (stats.pnl.bull > 0 ? '+' : '') + stats.pnl.bull.toFixed(2);
+                    document.getElementById('bear-pnl').innerText = (stats.pnl.bear > 0 ? '+' : '') + stats.pnl.bear.toFixed(2);
+                }
+
+                // Update Heartbeat Dot
+                const dot = document.getElementById('data-dot');
+                const txt = document.getElementById('data-text');
+                if (stats.data_connected) {
+                    dot.className = "w-2 h-2 rounded-full bg-emerald-500 animate-pulse";
+                    txt.className = "text-[9px] font-bold uppercase text-emerald-400";
+                    txt.innerText = "Data Live";
+                } else {
+                    dot.className = "w-2 h-2 rounded-full bg-red-500";
+                    txt.className = "text-[9px] font-bold uppercase text-red-400";
+                    txt.innerText = "Disconnected";
+                }
+
+                // Update Engine Switch Visuals
+                if(stats.engine_status) {
+                    updateToggleVisual('bull', stats.engine_status.bull === "1");
+                    updateToggleVisual('bear', stats.engine_status.bear === "1");
+                }
+            }
+
+            // 2. Orders
+            const orders = await fetchAPI('/api/orders/');
+            if (orders) {
+                renderOrders(orders.bull, 'bull-orders-tbody', 'bull-order-count');
+                renderOrders(orders.bear, 'bear-orders-tbody', 'bear-order-count');
+            }
+
+            // 3. Scanner
+            const scanner = await fetchAPI('/api/scanner/');
+            if (scanner) {
+                renderScanner(scanner.bull, 'bull-scanner-list', 'bull-scan-count');
+                renderScanner(scanner.bear, 'bear-scanner-list', 'bear-scan-count');
+            }
+        }
+
+        // --- RENDERING ---
+        function renderOrders(list, bodyId, countId) {
+            const tbody = document.getElementById(bodyId);
+            document.getElementById(countId).innerText = list ? list.length : 0;
+            if(!list || list.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="5" class="text-center py-4 text-gray-500 italic">No executed orders</td></tr>';
+                return;
+            }
+            
+            tbody.innerHTML = '';
+            list.forEach(order => {
+                const isBanned = blacklisted.has(order.symbol);
+                const row = document.createElement('tr');
+                row.className = `hover:bg-gray-750 transition-colors ${isBanned ? 'opacity-50' : ''}`;
                 
-                {/* CREDENTIALS MODAL */}
-                {isCredentialsOpen && (
-                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm">
-                    <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-2xl w-96 p-5">
-                        <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
-                        <h3 className="text-sm font-bold text-gray-200 flex items-center gap-2"><Key size={16} /> API Credentials</h3>
-                        <button onClick={() => setIsCredentialsOpen(false)} className="text-gray-400 hover:text-white transition-colors"><X size={18} /></button>
+                row.innerHTML = `
+                    <td class="px-2 py-3">
+                        <div class="font-bold text-sm ${isBanned ? 'line-through text-red-400' : 'text-gray-100'}">
+                            ${order.symbol} <span class="text-[10px] font-normal text-gray-500">(${order.quantity})</span>
                         </div>
-                        <div className="space-y-4">
-                        {isAuthPending && <div className="bg-red-900/30 border border-red-500/50 text-red-200 text-xs p-2 rounded flex items-center gap-2"><ShieldAlert size={14}/> Authentication Required</div>}
-                        <div>
-                            <label className="block text-gray-400 text-xs font-bold mb-1">API Key</label>
-                            <input type="text" className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-xs text-gray-200 focus:border-blue-500 outline-none" value={credentials.apiKey} onChange={(e) => setCredentials({...credentials, apiKey: e.target.value})} placeholder="Enter Kite API Key" />
+                        <button onclick="window.open('https://in.tradingview.com/chart/?symbol=NSE:${order.symbol}')" class="text-[10px] text-blue-400 hover:text-blue-300 flex items-center gap-0.5 mt-0.5">Chart ↗</button>
+                    </td>
+                    <td class="px-2 py-3 font-mono text-gray-300">${order.entry.toFixed(2)}</td>
+                    <td class="px-2 py-3"><div class="text-green-400 font-medium">${order.target.toFixed(2)}</div><div class="text-red-400 font-medium">${order.sl.toFixed(2)}</div></td>
+                    <td class="px-2 py-3">
+                        <span class="font-mono font-bold ${order.pnl >= 0 ? 'text-green-400' : 'text-red-400'}">${order.pnl > 0 ? '+' : ''}${order.pnl.toFixed(2)}</span>
+                        <div class="mt-0.5 text-[9px] uppercase font-bold tracking-wider ${order.status === 'OPEN' ? 'text-blue-300' : 'text-gray-500'}">${order.status}</div>
+                    </td>
+                    <td class="px-2 py-3 text-right">
+                        <div class="flex justify-end gap-2">
+                            <button onclick="toggleBan('${order.symbol}')" class="p-1.5 rounded border transition-colors ${isBanned ? 'bg-red-900/20 border-red-800 text-red-500' : 'bg-gray-700 border-gray-600 text-gray-400'}">Ban</button>
+                            ${order.status === 'OPEN' ? `<button onclick="forceExit('${order.symbol}')" class="bg-red-900/80 text-red-100 hover:bg-red-700 transition-colors px-2 py-1 rounded border border-red-700 text-[10px] font-bold uppercase">Exit</button>` : ''}
                         </div>
-                        <div>
-                            <label className="block text-gray-400 text-xs font-bold mb-1">API Secret</label>
-                            <input type="password" className="w-full bg-gray-900 border border-gray-600 rounded p-2 text-xs text-gray-200 focus:border-blue-500 outline-none" value={credentials.apiSecret} onChange={(e) => setCredentials({...credentials, apiSecret: e.target.value})} placeholder="Enter Secret" />
-                        </div>
-                        
-                        <div className="flex gap-2 pt-2">
-                            <button onClick={saveCredentials} className="flex-1 bg-gray-700 hover:bg-gray-600 text-white text-xs font-bold py-2 rounded transition-colors">Save Details</button>
-                            <button onClick={initiateKiteLogin} className="flex-1 bg-blue-600 hover:bg-blue-700 text-white text-xs font-bold py-2 rounded transition-colors flex items-center justify-center gap-1"><Power size={12} /> Login to Kite</button>
-                        </div>
-                        
-                        {isConnected && <div className="text-center text-[10px] text-emerald-500 flex items-center justify-center gap-1 mt-2"><CheckCircle size={10} /> Keys Configured</div>}
-                        </div>
-                    </div>
-                    </div>
-                )}
+                    </td>
+                `;
+                tbody.appendChild(row);
+            });
+        }
 
-                {/* GLOBAL SETTINGS MODAL */}
-                {isGlobalSettingsOpen && (
-                    <div className="fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm">
-                    <div className="bg-gray-800 border border-gray-700 rounded-lg shadow-2xl w-96 p-5">
-                        <div className="flex justify-between items-center mb-4 border-b border-gray-700 pb-3">
-                        <h3 className="text-sm font-bold text-gray-200 flex items-center gap-2"><Settings size={16} /> Global Volume SMA Criteria</h3>
-                        <button onClick={() => setIsGlobalSettingsOpen(false)} className="text-gray-400 hover:text-white transition-colors"><X size={18} /></button>
-                        </div>
-                        <div className="space-y-4">
-                        <div className="bg-blue-900/20 border border-blue-800/50 rounded p-2 text-xs text-blue-300 flex items-start gap-2"><Info size={14} className="mt-0.5 flex-shrink-0" /><span>Engines pass if <strong>ANY</strong> of the 3 criteria levels below are met.</span></div>
-                        <div className="grid grid-cols-3 gap-2 text-xs font-bold text-gray-400 uppercase tracking-wider mb-1"><div className="pl-1">Level</div><div>Min Vol Price (Cr)</div><div>SMA Multiplier</div></div>
-                        {globalSettings.volume_criteria.map((criteria, index) => (
-                            <div key={criteria.id} className="grid grid-cols-3 gap-2 items-center bg-gray-900/50 p-2 rounded border border-gray-700">
-                                <div className="text-sm font-bold text-gray-300 pl-1">Level {criteria.id}</div>
-                                <input type="number" value={criteria.min_vol_price_cr} onChange={(e) => updateGlobalSetting(index, 'min_vol_price_cr', e.target.value)} className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-center text-amber-400 font-mono font-bold focus:border-blue-500 outline-none" />
-                                <div className="flex items-center"><span className="text-gray-500 mr-1 text-xs">x</span><input type="number" value={criteria.sma_multiplier} onChange={(e) => updateGlobalSetting(index, 'sma_multiplier', e.target.value)} className="bg-gray-800 border border-gray-600 rounded px-2 py-1 text-sm text-center text-cyan-400 font-mono font-bold focus:border-blue-500 outline-none w-full" /></div>
-                            </div>
-                        ))}
-                        <div className="pt-2"><button onClick={saveGlobalCriteria} className="w-full bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold py-2.5 rounded transition-colors uppercase tracking-wider shadow-lg">Save Global Criteria</button></div>
-                        </div>
-                    </div>
-                    </div>
-                )}
+        function renderScanner(list, divId, countId) {
+            const container = document.getElementById(divId);
+            document.getElementById(countId).innerText = list ? list.length : 0;
+            if(!list || list.length === 0) {
+                container.innerHTML = '<div class="text-center py-4 text-gray-500 italic text-xs">No signals generated today</div>';
+                return;
+            }
 
-                <main className="p-4 grid grid-cols-2 gap-4 flex-1 items-start">
-                    <section className="flex flex-col bg-gray-900 p-3 rounded-xl border-t-4 border-emerald-600 shadow-xl min-h-full">
-                    <div className="flex items-center gap-2 mb-2 text-emerald-100 bg-emerald-900/20 p-1.5 rounded-lg border border-emerald-800/30">
-                        <TrendingUp size={14} className="text-emerald-400" />
-                        <h2 className="text-[9px] font-bold uppercase tracking-wider flex-1 flex items-center gap-2">BULL P&L: <span className={`text-sm ${pnlData.bull >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pnlData.bull > 0 ? '+' : ''}{pnlData.bull}</span></h2>
-                        <button className="bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold uppercase px-1.5 py-1 rounded flex items-center gap-1 shadow-md border border-red-500 transition-transform active:scale-95" onClick={() => panicExit('bull')}><ShieldAlert size={12} /> EXIT ALL</button>
+            container.innerHTML = '';
+            list.forEach(item => {
+                const isBanned = blacklisted.has(item.symbol);
+                const statusColor = item.status === 'PENDING' ? 'text-blue-400' : (item.status === 'EXPIRED' ? 'text-gray-500' : 'text-red-400');
+                
+                const div = document.createElement('div');
+                div.className = `flex items-center gap-2 p-2 rounded bg-gray-750 border border-gray-700 transition-all ${isBanned ? 'opacity-50 grayscale' : 'hover:border-blue-500/50 hover:bg-gray-700'}`;
+                div.innerHTML = `
+                    <div class="font-bold text-xs w-20 flex items-center gap-1 ${isBanned ? 'line-through text-gray-500' : 'text-gray-200'}">
+                        ${item.symbol}
+                        <button onclick="window.open('https://in.tradingview.com/chart/?symbol=NSE:${item.symbol}')" class="text-gray-500 hover:text-blue-400">↗</button>
                     </div>
-                    <EngineSettings settings={bullSettings} setSettings={setBullSettings} side="bull" />
-                    <OrderTable orders={bullOrders} />
-                    <ScannerList scannerData={bullScanner} />
-                    </section>
+                    <div class="text-[10px] text-gray-400 font-mono w-14">${item.time}</div>
+                    <div class="text-[9px] font-bold uppercase w-20 truncate ${statusColor}">${item.status}</div>
+                    <div class="flex items-center gap-1 text-[10px]"><span class="text-gray-500">VP:</span><span class="font-extrabold text-amber-300">${item.volume_price}</span></div>
+                    <div class="flex items-center gap-1 text-[10px]"><span class="text-gray-500">Sz:</span><span class="font-extrabold text-cyan-300">${item.candle_size}</span></div>
+                    <div class="ml-auto font-mono font-bold text-gray-300 text-xs">₹${item.price}</div>
+                    <button onclick="toggleBan('${item.symbol}')" class="p-1 rounded-full flex-shrink-0 transition-colors ml-2 ${isBanned ? 'text-red-500 bg-red-900/20' : 'text-gray-500 hover:text-red-400 hover:bg-gray-600'}">Ø</button>
+                `;
+                container.appendChild(div);
+            });
+        }
 
-                    <section className="flex flex-col bg-gray-900 p-3 rounded-xl border-t-4 border-rose-600 shadow-xl min-h-full">
-                        <div className="flex items-center gap-2 mb-2 text-rose-100 bg-rose-900/20 p-1.5 rounded-lg border border-rose-800/30">
-                        <TrendingDown size={14} className="text-rose-400" />
-                        <h2 className="text-[9px] font-bold uppercase tracking-wider flex-1 flex items-center gap-2">BEAR P&L: <span className={`text-sm ${pnlData.bear >= 0 ? 'text-emerald-400' : 'text-rose-400'}`}>{pnlData.bear > 0 ? '+' : ''}{pnlData.bear}</span></h2>
-                        <button className="bg-red-600 hover:bg-red-700 text-white text-[10px] font-bold uppercase px-1.5 py-1 rounded flex items-center gap-1 shadow-md border border-red-500 transition-transform active:scale-95" onClick={() => panicExit('bear')}><ShieldAlert size={12} /> EXIT ALL</button>
+        // --- CONTROLS ---
+        function toggleBan(symbol) {
+            const isBanned = blacklisted.has(symbol);
+            if(isBanned) blacklisted.delete(symbol); else blacklisted.add(symbol);
+            postAPI(isBanned ? 'unban_symbol' : 'ban_symbol', { symbol });
+            updateDashboard(); 
+        }
+
+        function forceExit(symbol) {
+            if(confirm(`Force EXIT ${symbol}?`)) {
+                postAPI('exit_trade', { symbol });
+            }
+        }
+
+        function panicExit(side) {
+            if(confirm(`EXIT ALL ${side.toUpperCase()} TRADES?`)) {
+                postAPI('panic_exit', { side });
+            }
+        }
+
+        function toggleEngine(side, forceState = null) {
+            const newState = forceState !== null ? forceState : !engineStatus[side];
+            engineStatus[side] = newState;
+            updateToggleVisual(side, newState);
+            postAPI('toggle_engine', { side, enabled: newState });
+        }
+
+        function updateToggleVisual(side, enabled) {
+            engineStatus[side] = enabled;
+            const btn = document.getElementById(`btn-${side}-toggle`);
+            const dot = document.getElementById(`dot-${side}-toggle`);
+            const color = side === 'bull' ? 'bg-emerald-500' : 'bg-rose-500';
+            
+            if(enabled) {
+                btn.className = `w-8 h-4 rounded-full flex items-center px-0.5 mx-2 transition-colors ${color}`;
+                dot.className = `w-3 h-3 bg-white rounded-full shadow-md transform translate-x-4 transition-transform`;
+            } else {
+                btn.className = `w-8 h-4 rounded-full flex items-center px-0.5 mx-2 transition-colors bg-gray-600`;
+                dot.className = `w-3 h-3 bg-white rounded-full shadow-md transform translate-x-0 transition-transform`;
+            }
+        }
+
+        // --- SETTINGS MODAL ---
+        async function openSettings(side) {
+            activeEngine = side;
+            const modal = document.getElementById('settings-modal');
+            const title = document.getElementById('modal-title');
+            const color = side === 'bull' ? 'text-emerald-400' : 'text-rose-400';
+            const border = side === 'bull' ? 'border-emerald-600' : 'border-rose-600';
+            const btn = document.getElementById('btn-save-settings');
+            
+            // Style
+            title.className = `text-sm font-bold flex items-center gap-2 ${color}`;
+            document.getElementById('modal-container').className = `bg-gray-800 border ${border} rounded-lg shadow-2xl w-[40rem] p-5 max-h-[90vh] flex flex-col`;
+            btn.className = `w-full text-white text-xs font-bold py-2.5 rounded transition-colors uppercase tracking-wider shadow-lg bg-${side==='bull'?'emerald':'rose'}-600 hover:bg-${side==='bull'?'emerald':'rose'}-700`;
+            title.innerHTML = `<i data-lucide="settings" class="w-4 h-4"></i> ${side.toUpperCase()} Configuration`;
+            if(window.lucide) lucide.createIcons();
+
+            // Load Data
+            const engineData = await fetchAPI(`/api/settings/engine/${side}/`);
+            const globalData = await fetchAPI('/api/settings/global/');
+            
+            // Populate Inputs
+            document.getElementById('inp-rr').value = engineData.risk_reward;
+            document.getElementById('inp-tsl').value = engineData.trailing_sl;
+            document.getElementById('inp-max-trades').value = engineData.total_trades;
+            document.getElementById('inp-start').value = engineData.start_time;
+            document.getElementById('inp-end').value = engineData.end_time;
+            document.getElementById('inp-tps').value = engineData.trades_per_stock;
+            document.getElementById('inp-r1').value = engineData.risk_trade_1;
+            document.getElementById('inp-r2').value = engineData.risk_trade_2;
+            document.getElementById('inp-r3').value = engineData.risk_trade_3;
+            document.getElementById('inp-max-p').value = engineData.max_profit;
+            document.getElementById('inp-max-l').value = engineData.max_loss;
+            document.getElementById('inp-pnl-enabled').checked = engineData.pnl_exit_enabled;
+
+            // Render Volume Levels
+            renderVolumeInputs(globalData.volume_criteria || []);
+
+            modal.classList.remove('hidden');
+        }
+
+        function closeSettings() {
+            document.getElementById('settings-modal').classList.add('hidden');
+            activeEngine = null;
+        }
+
+        function renderVolumeInputs(criteria) {
+            const container = document.getElementById('volume-levels-container');
+            container.innerHTML = '';
+            
+            const rows = Array.from({length: 10}, (_, i) => criteria[i] || {
+                min_vol_price_cr: (i+1)*5, sma_multiplier: 2.0, min_sma_avg: 50000
+            });
+
+            rows.forEach((c, i) => {
+                const div = document.createElement('div');
+                div.className = "flex items-center gap-2 bg-gray-900/50 p-2 rounded border border-gray-700 text-[10px]";
+                div.innerHTML = `
+                    <div class="font-bold text-gray-400 w-8">Lvl ${i+1}</div>
+                    <div class="flex-1">
+                        <label class="block text-gray-500 uppercase text-[8px] mb-0.5">Min VP (Cr)</label>
+                        <input type="number" class="vol-inp-vp bg-gray-800 border border-gray-600 rounded px-1 py-0.5 w-full text-amber-400 font-bold" value="${c.min_vol_price_cr}">
                     </div>
-                    <EngineSettings settings={bearSettings} setSettings={setBearSettings} side="bear" />
-                    <OrderTable orders={bearOrders} />
-                    <ScannerList scannerData={bearScanner} />
-                    </section>
-                </main>
-                </div>
-            );
-        };
+                    <div class="text-gray-600 font-bold px-1">&</div>
+                    <div class="flex-1">
+                        <label class="block text-gray-500 uppercase text-[8px] mb-0.5">SMA Mult</label>
+                        <input type="number" class="vol-inp-sma bg-gray-800 border border-gray-600 rounded px-1 py-0.5 w-full text-cyan-400 font-bold" value="${c.sma_multiplier}">
+                    </div>
+                    <div class="text-gray-600 font-bold px-1">&</div>
+                    <div class="flex-1">
+                        <label class="block text-gray-500 uppercase text-[8px] mb-0.5">Min Avg Vol</label>
+                        <input type="number" class="vol-inp-avg bg-gray-800 border border-gray-600 rounded px-1 py-0.5 w-full text-emerald-400 font-bold" value="${c.min_sma_avg}">
+                    </div>
+                `;
+                container.appendChild(div);
+            });
+        }
 
-        const root = ReactDOM.createRoot(document.getElementById('root'));
-        root.render(<Dashboard />);
+        async function saveSettings() {
+            if(!activeEngine) return;
+
+            const enginePayload = {
+                risk_reward: document.getElementById('inp-rr').value,
+                trailing_sl: document.getElementById('inp-tsl').value,
+                total_trades: document.getElementById('inp-max-trades').value,
+                start_time: document.getElementById('inp-start').value,
+                end_time: document.getElementById('inp-end').value,
+                trades_per_stock: document.getElementById('inp-tps').value,
+                risk_trade_1: document.getElementById('inp-r1').value,
+                risk_trade_2: document.getElementById('inp-r2').value,
+                risk_trade_3: document.getElementById('inp-r3').value,
+                max_profit: document.getElementById('inp-max-p').value,
+                max_loss: document.getElementById('inp-max-l').value,
+                pnl_exit_enabled: document.getElementById('inp-pnl-enabled').checked
+            };
+
+            const vps = document.querySelectorAll('.vol-inp-vp');
+            const smas = document.querySelectorAll('.vol-inp-sma');
+            const avgs = document.querySelectorAll('.vol-inp-avg');
+            const volCriteria = [];
+            
+            vps.forEach((_, i) => {
+                volCriteria.push({
+                    min_vol_price_cr: vps[i].value,
+                    sma_multiplier: smas[i].value,
+                    min_sma_avg: avgs[i].value
+                });
+            });
+
+            await fetch(`/api/settings/engine/${activeEngine}/`, {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify(enginePayload)
+            });
+
+            await fetch('/api/settings/global/', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ volume_criteria: volCriteria })
+            });
+
+            closeSettings();
+            alert("Settings Saved!");
+        }
+
+        // Initialize
+        setInterval(updateDashboard, 1000); 
+        updateDashboard(); 
+
     </script>
 </body>
 </html>

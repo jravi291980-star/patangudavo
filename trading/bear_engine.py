@@ -2,7 +2,7 @@
 CashBreakdown Client (Short Sell Engine) - Final Production Version
 - Target RECALCULATED based on Actual Executed Price.
 - Fully Integrated with React Frontend Controls (Ban, Toggle, Panic).
-- Uses Tiered Risk & Global -ettings.
+- Implements STEP-BASED (Ladder) Trailing SL and 10-Level Volume Logic.
 """
 
 import json
@@ -104,6 +104,7 @@ class CashBreakdownClient:
         self.trade_count_key = f"breakdown_trade_count:{self.account.id}:{today_iso}"
         self.active_entries_set = f"breakdown_active_entries:{self.account.id}"
         self.exiting_trades_set = f"breakdown_exiting_trades:{self.account.id}"
+        self.force_exit_set = f"breakdown_force_exit_requests:{self.account.id}"
         self.entry_lock_key_prefix = f"cbd_entry_lock:{self.account.id}"
         self.daily_pnl_key = f"cbd_daily_realized_pnl:{self.account.id}:{today_iso}"
 
@@ -142,7 +143,8 @@ class CashBreakdownClient:
     def _is_symbol_blacklisted(self, symbol: str) -> bool:
         try: return redis_client.sismember(KEY_BLACKLIST, symbol)
         except: return False
-# ------------------- Daily housekeeping -------------------
+
+    # ------------------- Daily housekeeping -------------------
     def _daily_reset_trades(self) -> None:
         """Reset DB + Redis state once per day after DAILY_RESET_TIME."""
         now_ist = dt.now(IST)
@@ -157,7 +159,7 @@ class CashBreakdownClient:
         if reset_time_passed and redis_client.set(reset_flag_key, "1", nx=True, ex=86400 * 2):
             logger.warning("CBD(%s): Performing daily reset for date=%s", self.account.user.username, target_reset_date)
             try:
-                CashBreakdownTrade.objects.filter(account=self.account).delete()
+                # CashBreakdownTrade.objects.filter(account=self.account).delete()
                 with redis_client.pipeline() as pipe:
                     pipe.delete(self.trade_count_key)
                     pipe.delete(self.limit_reached_key)
@@ -255,6 +257,26 @@ class CashBreakdownClient:
         return self.kite.place_order(tradingsymbol=symbol, quantity=qty, transaction_type=txn_type, product=self.kite.PRODUCT_MIS, order_type=self.kite.ORDER_TYPE_MARKET, exchange=self.kite.EXCHANGE_NSE, variety=self.kite.VARIETY_REGULAR)
 
     # ------------------- 1. SCANNER (Process Candle) -------------------
+    
+    # --- UPDATED: 10-Level Volume Logic ---
+    def _check_volume_criteria(self, vol, vol_sma, vol_price_cr):
+        global_settings = self._get_global_settings()
+        criteria_list = global_settings.get("volume_criteria", [])
+        
+        if not criteria_list: return False
+
+        for level in criteria_list:
+            try:
+                min_vp = float(level.get('min_vol_price_cr', 999999))
+                sma_mult = float(level.get('sma_multiplier', 99))
+                min_sma = float(level.get('min_sma_avg', 0)) 
+
+                if vol_price_cr >= min_vp:
+                    if vol_sma >= min_sma and vol >= (vol_sma * sma_mult):
+                        return True
+            except: continue
+        return False
+
     def _process_candle(self, candle_payload: Dict[str, Any]) -> None:
         symbol = candle_payload.get("symbol")
         if not symbol: return
@@ -282,7 +304,7 @@ class CashBreakdownClient:
             close = float(candle_payload.get("close") or 0)
             open_p = float(candle_payload.get("open") or 0)
             ts = _parse_candle_ts(candle_payload.get("ts"))
-            vol_sma = float(candle_payload.get("vol_sma_375") or 0)
+            vol_sma = float(candle_payload.get("vol_sma_375") or 0) # 1875 SMA
             vol_price_cr = float(candle_payload.get("vol_price_cr") or 0)
         except: return
 
@@ -293,21 +315,15 @@ class CashBreakdownClient:
         if not (low < prev_low): return
         if ((high - low) / ref) > BREAKDOWN_MAX_CANDLE_PCT: return
 
-        # Global Volume Check
-        global_settings = self._get_global_settings()
-        passed = False
-        for level in global_settings.get("volume_criteria", []):
-            if vol_price_cr >= float(level.get('min_vol_price_cr', 999)):
-                if vol_sma > 100 and vol >= (vol_sma * float(level.get('sma_multiplier', 999))):
-                    passed = True; break
-        
-        if not passed: return
+        # NEW: Volume Check
+        if not self._check_volume_criteria(vol, vol_sma, vol_price_cr): return
 
         # Register Setup
         rr_mult = _parse_ratio_string(bear_settings.get("risk_reward", "1:2"), 2.0)
         entry = low * (1.0 - ENTRY_OFFSET_PCT)
         stop = high + (high * STOP_OFFSET_PCT)
-        # Short Target = Entry - (Risk * R)
+        
+        # Placeholder target (overwritten on entry)
         risk = stop - entry
         target = entry - (rr_mult * risk)
 
@@ -321,7 +337,7 @@ class CashBreakdownClient:
                 )
                 self.pending_trades[symbol] = t
                 redis_client.sadd(self.active_entries_set, symbol)
-                logger.info(f"CBD: Setup Found {symbol} (Target: {target:.2f})")
+                logger.info(f"CBD: Setup Found {symbol} (Est Target: {target:.2f})")
         except Exception as e: logger.error(f"CBD: Setup error {symbol}: {e}")
 
     # ------------------- 2. ENTRY EXECUTION -------------------
@@ -380,6 +396,65 @@ class CashBreakdownClient:
         for s in to_remove: self.pending_trades.pop(s, None)
 
     # ------------------- 3. MONITORING (Always Runs) -------------------
+    
+    # --- UPDATED: STEP-BASED TRAILING (LADDER LOGIC) FOR SHORT ---
+    def _check_trailing_stop(self, trade, ltp):
+        """
+        Updates Stop Loss in STEPS based on a Ratio for SHORT trades.
+        Example: Entry 100, SL 105, Risk 5. Ratio 1.5 -> Step 7.5.
+        - Moves to Cost (100) when Profit >= 7.5 (LTP <= 92.5).
+        - Moves to 92.5 when Profit >= 15.0 (LTP <= 85.0).
+        """
+        if trade.status != "OPEN": return
+
+        # 1. Determine Initial Risk (R)
+        settings = self._get_bear_settings()
+        risk_reward_rr = _parse_ratio_string(settings.get("risk_reward", "1:2"), 2.0)
+
+        # Reverse engineer risk if we are already in profit/trailed
+        # For Short: Original SL > Entry. If current SL <= Entry, we have trailed.
+        if trade.stop_level <= trade.entry_price:
+            # Risk = (Entry - Target) / Original_RR
+            div = risk_reward_rr if risk_reward_rr > 0 else 2.0
+            init_risk = (trade.entry_price - trade.target_level) / div
+        else:
+            # Standard calculation: SL - Entry
+            init_risk = trade.stop_level - trade.entry_price
+
+        if init_risk <= 0: return
+
+        # 2. Calculate Step Size (S)
+        trail_ratio_str = settings.get("trailing_sl", "1:1.5")
+        trail_ratio_mult = _parse_ratio_string(trail_ratio_str, 1.5)
+
+        step_size = init_risk * trail_ratio_mult
+
+        # 3. Calculate Current Profit (Short: Entry - LTP)
+        current_profit = trade.entry_price - ltp
+
+        # 4. Determine Ladder Level
+        if current_profit < step_size:
+            return # Haven't reached the first step yet
+
+        # How many full steps have we climbed?
+        levels_gained = floor(current_profit / step_size)
+
+        # Calculate where the SL should be for this level
+        # Formula for Short: New SL = Entry - ((Level - 1) * Step_Size)
+        # Level 1 -> Entry - 0 = Cost
+        # Level 2 -> Entry - 7.5 = First Target (in direction of profit)
+        new_sl_level = trade.entry_price - ((levels_gained - 1) * step_size)
+
+        # 5. Update SL only if it moves DOWN (Tightening for Short)
+        # Round to nearest tick (0.05)
+        new_sl_level = round(new_sl_level * 20) / 20
+
+        if new_sl_level < trade.stop_level:
+            old_sl = trade.stop_level
+            trade.stop_level = new_sl_level
+            trade.save(update_fields=['stop_level'])
+            logger.info(f"CBD: STEP TRAIL {trade.symbol}. Lvl:{levels_gained} | Profit:{current_profit:.2f} | SL: {old_sl} -> {new_sl_level}")
+
     def monitor_trades(self) -> None:
         # Panic Check
         if redis_client.exists(KEY_PANIC_TRIGGER):
@@ -392,9 +467,13 @@ class CashBreakdownClient:
         live_ohlc = self._get_live_ohlc()
         unrealized_pnl = 0.0
 
-        trail_mult = _parse_ratio_string(settings.get("trailing_sl", "1:1"), 1.0)
-
         for symbol, trade in list(self.open_trades.items()):
+            # CHECK INDIVIDUAL EXIT
+            if redis_client.sismember(self.force_exit_set, str(trade.id)):
+                self.exit_trade(trade, live_ohlc.get(symbol, {}).get("ltp", 0.0), "Manual Exit")
+                redis_client.srem(self.force_exit_set, str(trade.id))
+                continue
+
             if redis_client.sismember(self.exiting_trades_set, trade.id): continue
             
             ltp = live_ohlc.get(symbol, {}).get("ltp", 0.0)
@@ -405,16 +484,9 @@ class CashBreakdownClient:
 
             # Short PnL: (Entry - Current) * Qty
             unrealized_pnl += (trade.entry_price - ltp) * trade.quantity
-            risk = trade.stop_level - trade.entry_price
 
-            # Trailing (If price drops significantly, move SL down to Entry)
-            if risk > 0 and trade.stop_level > trade.entry_price:
-                # If LTP <= Entry - (1R)
-                trigger_price = trade.entry_price - (trail_mult * risk)
-                if ltp <= trigger_price:
-                    trade.stop_level = trade.entry_price
-                    trade.save(update_fields=['stop_level'])
-                    logger.info(f"CBD: TSL -> Breakeven for {symbol}")
+            # Step-Based Trailing
+            self._check_trailing_stop(trade, ltp)
 
             # Exits
             if ltp >= trade.stop_level: self.exit_trade(trade, ltp, "SL Hit")
@@ -425,7 +497,11 @@ class CashBreakdownClient:
             try: realized = float(redis_client.get(self.daily_pnl_key) or 0)
             except: realized = 0.0
             net = realized + unrealized_pnl
-            if net >= float(settings.get("max_profit", 999999)) or net <= -1 * float(settings.get("max_loss", 999999)):
+            
+            max_p = float(settings.get("max_profit", 999999))
+            max_l = float(settings.get("max_loss", 999999))
+
+            if net >= max_p or net <= -max_l:
                 redis_client.sadd(self.limit_reached_key, "P&L_EXIT")
                 self.force_square_off(f"P&L Exit (Net: {net:.2f})")
 

@@ -8,34 +8,46 @@ class Account(models.Model):
     
     # --- Kite Connect Credentials ---
     api_key = models.CharField(max_length=50, blank=True, null=True)
-    api_secret = models.CharField(max_length=50, blank=True, null=True) # <--- ADDED THIS FIELD
+    api_secret = models.CharField(max_length=50, blank=True, null=True)
     access_token = models.CharField(max_length=255, blank=True, null=True)
     is_master = models.BooleanField(default=False, help_text="Is this the master account for data fetching?")
 
-    # --- Bull Engine Config (Hard Limits) ---
-    is_breakout_cash_active = models.BooleanField(default=True, verbose_name="Bull Engine Master Switch")
+    # --- Bull Engine Config (Synced with Dashboard) ---
+    is_breakout_cash_active = models.BooleanField(default=True, verbose_name="Bull Engine Switch")
     breakout_start_time = models.TimeField(default=time(9, 15))
     breakout_end_time = models.TimeField(default=time(15, 15))
-    breakout_max_total_trades = models.IntegerField(default=10, help_text="Max Bull trades per day")
-    breakout_per_trade_sl_amount = models.FloatField(default=1000.0, help_text="Max Rupees risk per Bull trade")
-    breakout_volume_price_threshold = models.FloatField(default=5000000.0, help_text="Min Volume*Price (Rupees)")
+    breakout_max_trades = models.IntegerField(default=5)
+    breakout_trades_per_stock = models.IntegerField(default=2)
+    breakout_risk_reward = models.CharField(max_length=10, default="1:2")
+    breakout_trailing_sl = models.CharField(max_length=10, default="1:1")
     
-    # --- Bear Engine Config (Hard Limits) ---
-    is_breakdown_cash_active = models.BooleanField(default=True, verbose_name="Bear Engine Master Switch")
+    # Tiered Risk (Bull)
+    breakout_risk_trade_1 = models.FloatField(default=2000.0)
+    breakout_risk_trade_2 = models.FloatField(default=1500.0)
+    breakout_risk_trade_3 = models.FloatField(default=1000.0)
+
+    # --- Bear Engine Config (Synced with Dashboard) ---
+    is_breakdown_cash_active = models.BooleanField(default=True, verbose_name="Bear Engine Switch")
     breakdown_start_time = models.TimeField(default=time(9, 15))
     breakdown_end_time = models.TimeField(default=time(15, 15))
-    breakdown_max_total_trades = models.IntegerField(default=10, help_text="Max Bear trades per day")
-    breakdown_per_trade_sl_amount = models.FloatField(default=1000.0, help_text="Max Rupees risk per Bear trade")
-    breakdown_volume_price_threshold = models.FloatField(default=5000000.0, help_text="Min Volume*Price (Rupees)")
+    breakdown_max_trades = models.IntegerField(default=5)
+    breakdown_trades_per_stock = models.IntegerField(default=2)
+    breakdown_risk_reward = models.CharField(max_length=10, default="1:2")
+    breakdown_trailing_sl = models.CharField(max_length=10, default="1:1")
 
-    # --- P&L Limits (DB Backup for Redis) ---
-    breakout_pnl_exit_enabled = models.BooleanField(default=False)
-    breakout_pnl_profit_target_amount = models.FloatField(default=5000.0)
-    breakout_pnl_stop_loss_amount = models.FloatField(default=2000.0)
+    # Tiered Risk (Bear)
+    breakdown_risk_trade_1 = models.FloatField(default=2000.0)
+    breakdown_risk_trade_2 = models.FloatField(default=1500.0)
+    breakdown_risk_trade_3 = models.FloatField(default=1000.0)
 
-    breakdown_pnl_exit_enabled = models.BooleanField(default=False)
-    breakdown_pnl_profit_target_amount = models.FloatField(default=5000.0)
-    breakdown_pnl_stop_loss_amount = models.FloatField(default=2000.0)
+    # --- Global Volume Settings (JSON for flexible criteria) ---
+    # Stores the list of 10 criteria levels
+    volume_settings_json = models.JSONField(default=dict, blank=True, null=True)
+
+    # --- P&L Limits ---
+    pnl_exit_enabled = models.BooleanField(default=False)
+    max_daily_profit = models.FloatField(default=5000.0)
+    max_daily_loss = models.FloatField(default=2000.0)
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

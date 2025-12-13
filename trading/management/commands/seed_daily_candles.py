@@ -16,25 +16,25 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone('Asia/Kolkata')
 
 class Command(BaseCommand):
-    help = 'Flushes Redis candle history and seeds it with previous trading day 1-minute data (Rate Limited).'
+    help = 'Seeds Redis with 5 days of 1-minute candle data for 1875 SMA.'
 
-    def _get_previous_trading_day(self):
-        """Finds the last valid trading day (skips weekends)."""
+    def _get_start_date(self, days_back=5):
+        """Finds the start date going back N trading days."""
         today = dt.now(IST).date()
-        prev_day = today - timedelta(days=1)
-        # 0=Monday, 4=Friday, 5=Saturday, 6=Sunday
-        while prev_day.weekday() >= 5:  # If Sat or Sun, go back
-            prev_day -= timedelta(days=1)
-        return prev_day
+        count = 0
+        curr = today
+        while count < days_back:
+            curr -= timedelta(days=1)
+            # 0=Mon, 4=Fri, 5=Sat, 6=Sun
+            if curr.weekday() < 5:
+                count += 1
+        return curr
 
     def _default_json_serializer(self, obj):
         if isinstance(obj, (dt, datetime_time)):
             return obj.isoformat()
         return str(obj)
 
-    # --- RETRY LOGIC ---
-    # Retry up to 3 times on Network/Data errors with exponential backoff.
-    # We do not retry on 429 immediately here because the global loop handles the pacing.
     @retry(
         retry=retry_if_exception_type((kite_exceptions.NetworkException, kite_exceptions.DataException, Exception)),
         stop=stop_after_attempt(3),
@@ -42,13 +42,9 @@ class Command(BaseCommand):
         reraise=True
     )
     def fetch_and_seed_stock(self, kite, symbol, token, from_date, to_date, redis_client):
-        """
-        Fetches data for a single stock and pushes to Redis.
-        """
         key = f'candles:1m:{symbol}'
         
-        # 1. Fetch 1-minute data
-        # Kite Historical API: interval='minute'
+        # Fetch 1-minute data for the extended period
         candles = kite.historical_data(
             instrument_token=token,
             from_date=from_date,
@@ -59,7 +55,6 @@ class Command(BaseCommand):
         if not candles:
             return 0
 
-        # 2. Process and Format
         formatted_candles = []
         for candle in candles:
             payload = {
@@ -71,8 +66,7 @@ class Command(BaseCommand):
                 'low': candle['low'],
                 'close': candle['close'],
                 'volume': candle['volume'],
-                # Set SMA to 0 for historicals; Live engine calculates baseline from these.
-                'vol_sma_375': 0, 
+                'vol_sma_375': 0, # Will be calc'd by live engine
                 'vol_price_cr': round((candle['volume'] * candle['close']) / 10000000.0, 4)
             }
             formatted_candles.append(json.dumps(payload, default=self._default_json_serializer))
@@ -80,19 +74,16 @@ class Command(BaseCommand):
         if not formatted_candles:
             return 0
 
-        # 3. Flush & Push to Redis (Atomic Pipeline)
         pipe = redis_client.pipeline()
-        pipe.delete(key) # Flush old data
-        pipe.rpush(key, *formatted_candles) # Seed new data
+        pipe.delete(key)
+        pipe.rpush(key, *formatted_candles)
         pipe.execute()
 
         return len(formatted_candles)
 
     def handle(self, *args, **options):
         redis_client = get_redis_connection()
-        if not redis_client:
-            self.stdout.write(self.style.ERROR("Redis connection failed"))
-            return
+        if not redis_client: return
 
         master_account = Account.objects.filter(is_master=True, user__is_superuser=True).first()
         if not master_account:
@@ -101,15 +92,15 @@ class Command(BaseCommand):
 
         kite = get_kite(master_account)
         
-        # 1. Determine Date Range
-        prev_date = self._get_previous_trading_day()
-        from_date = dt.combine(prev_date, datetime_time(9, 15))
-        to_date = dt.combine(prev_date, datetime_time(15, 30))
+        # 1. 5 Days Lookback for 1875 SMA
+        start_date = self._get_start_date(days_back=5)
+        end_date = dt.now(IST).date()
+        
+        from_date = dt.combine(start_date, datetime_time(9, 15))
+        to_date = dt.combine(end_date, datetime_time(15, 30))
 
-        self.stdout.write(self.style.SUCCESS(f"Seeding data for Date: {prev_date} ({from_date} to {to_date})"))
+        self.stdout.write(self.style.SUCCESS(f"Seeding 5-day history: {from_date} to {to_date}"))
 
-        # 2. Map Tokens
-        logger.info("Fetching Instrument dump...")
         try:
             instruments = kite.instruments("NSE")
         except Exception as e:
@@ -117,50 +108,22 @@ class Command(BaseCommand):
             return
 
         target_symbols = settings.STOCK_INDEX_MAPPING.keys()
-        
-        symbol_token_map = {}
-        for inst in instruments:
-            if inst['tradingsymbol'] in target_symbols:
-                symbol_token_map[inst['tradingsymbol']] = inst['instrument_token']
+        symbol_token_map = {i['tradingsymbol']: i['instrument_token'] for i in instruments if i['tradingsymbol'] in target_symbols}
 
         total_stocks = len(symbol_token_map)
-        logger.info(f"Found {total_stocks} tokens matching universe.")
-
-        # 3. Sequential Execution with Rate Limiting
-        total_seeded = 0
         stocks_processed = 0
-        errors = 0
         
-        start_time = time.time()
-        
-        self.stdout.write(f"Starting sequential processing of {total_stocks} stocks...")
+        self.stdout.write(f"Processing {total_stocks} stocks...")
 
         for symbol, token in symbol_token_map.items():
             try:
-                count = self.fetch_and_seed_stock(
-                    kite, symbol, token, from_date, to_date, redis_client
-                )
-                total_seeded += count
+                self.fetch_and_seed_stock(kite, symbol, token, from_date, to_date, redis_client)
             except Exception as e:
-                # Log error but continue to next stock
-                logger.error(f"SEED: Error processing {symbol}: {e}")
-                self.stdout.write(self.style.ERROR(f"Failed {symbol}: {e}"))
-                errors += 1
+                logger.error(f"SEED: Error {symbol}: {e}")
             
             stocks_processed += 1
-            
-            # Progress bar style output
-            if stocks_processed % 25 == 0:
-                 self.stdout.write(f"Progress: {stocks_processed}/{total_stocks} | Errors: {errors}")
+            if stocks_processed % 20 == 0:
+                self.stdout.write(f"Processed: {stocks_processed}/{total_stocks}")
+            time.sleep(0.4) # Rate limit
 
-            # --- RATE LIMIT ENFORCEMENT ---
-            # Kite Limit: 3 requests/second (1 req every 0.33s).
-            # Sleep 0.4s to be safe and account for network overhead.
-            time.sleep(0.4) 
-
-        duration = time.time() - start_time
-        
-        self.stdout.write(self.style.SUCCESS(
-            f"DONE. Seeded {total_seeded} candles. Processed {stocks_processed} stocks. "
-            f"Errors: {errors}. Time taken: {duration:.2f}s"
-        ))
+        self.stdout.write(self.style.SUCCESS("Seeding Complete."))
