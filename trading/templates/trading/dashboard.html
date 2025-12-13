@@ -43,25 +43,72 @@
            <div class="w-5 h-5 bg-blue-700 rounded flex items-center justify-center font-bold text-[9px] text-white shadow-lg">KM</div>
            <h1 class="text-xl font-bold tracking-tight text-gray-100 leading-none">Kite <span class="text-blue-500 font-light">Master</span></h1>
         </div>
+        
         <div class="flex items-center gap-4 ml-auto">
-            <!-- Data Heartbeat -->
-            <div class="flex items-center gap-2 px-2 py-1 bg-gray-800 rounded border border-gray-700">
-                <div id="data-dot" class="w-2 h-2 rounded-full bg-red-500"></div>
-                <span id="data-text" class="text-[9px] font-bold uppercase text-red-400">Disconnected</span>
+            
+            <!-- SENTIMENT WIDGET (RESTORED) -->
+            <div class="flex items-center gap-2 px-3 py-0.5 rounded border border-gray-700 bg-gray-900/50">
+                <div class="flex items-center gap-1">
+                    <i data-lucide="bar-chart-2" class="w-3 h-3 text-emerald-400" id="sentiment-icon"></i>
+                    <span class="text-sm font-black tracking-tight text-emerald-400" id="sentiment-pct">0%</span>
+                </div>
+                <div class="h-4 w-px bg-gray-700"></div>
+                <div class="text-[10px] font-mono font-bold text-gray-400 flex gap-2">
+                    <span>BULL: <span class="text-emerald-400" id="sentiment-bull-count">0</span></span>
+                    <span>BEAR: <span class="text-rose-400" id="sentiment-bear-count">0</span></span>
+                </div>
             </div>
 
             <div class="text-[10px] font-bold uppercase tracking-wider flex items-center gap-2 bg-gray-800 px-2 py-0.5 rounded border border-gray-700">
                 <span class="text-gray-400">Total P&L:</span>
                 <span id="total-pnl" class="text-sm text-gray-100">0.00</span>
             </div>
+
+            <!-- Data Heartbeat -->
+            <div class="flex items-center gap-2 px-2 py-1 bg-gray-800 rounded border border-gray-700">
+                <div id="data-dot" class="w-2 h-2 rounded-full bg-red-500"></div>
+                <span id="data-text" class="text-[9px] font-bold uppercase text-red-400">Disconnected</span>
+            </div>
             
             <div class="flex items-center gap-3 text-[9px]">
-               <button onclick="window.location.href='/api/kite/login/'" class="flex items-center gap-1 text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded border border-gray-600 transition-colors font-bold uppercase tracking-wide">
-                  <i data-lucide="key" class="w-3 h-3"></i> Login Kite
+               <button onclick="openApiModal()" class="flex items-center gap-1 text-gray-300 hover:text-white bg-gray-800 hover:bg-gray-700 px-2 py-1 rounded border border-gray-600 transition-colors font-bold uppercase tracking-wide">
+                  <i data-lucide="key" class="w-3 h-3"></i> API Creds
                </button>
             </div>
         </div>
     </header>
+
+    <!-- API CREDENTIALS MODAL (RESTORED) -->
+    <div id="api-modal" class="fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm hidden">
+        <div class="bg-gray-800 border border-gray-700 rounded-lg shadow-2xl w-96 p-6">
+            <div class="flex justify-between items-center mb-6">
+                <h3 class="text-lg font-bold text-white flex items-center gap-2"><i data-lucide="key" class="w-5 h-5 text-blue-500"></i> API Credentials</h3>
+                <button onclick="closeApiModal()" class="text-gray-400 hover:text-white transition-colors"><i data-lucide="x" class="w-5 h-5"></i></button>
+            </div>
+            
+            <div class="space-y-4">
+                <div>
+                    <label class="block text-gray-400 text-xs font-bold mb-1 uppercase tracking-wide">API Key</label>
+                    <input id="api-key-input" type="text" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500" placeholder="Enter Kite API Key">
+                </div>
+                
+                <div>
+                    <label class="block text-gray-400 text-xs font-bold mb-1 uppercase tracking-wide">API Secret</label>
+                    <input id="api-secret-input" type="password" class="w-full bg-gray-900 border border-gray-600 rounded px-3 py-2 text-sm text-white focus:outline-none focus:border-blue-500" placeholder="Enter Kite API Secret">
+                </div>
+
+                <button onclick="saveApiCredentials()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded transition-colors flex items-center justify-center gap-2 text-sm">
+                    <i data-lucide="save" class="w-4 h-4"></i> Save Details
+                </button>
+
+                <div class="border-t border-gray-700 my-4 pt-4">
+                    <button onclick="window.location.href='/api/kite/login/'" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-bold py-2 rounded transition-colors flex items-center justify-center gap-2 text-sm">
+                        <i data-lucide="log-in" class="w-4 h-4"></i> Login to Kite
+                    </button>
+                </div>
+            </div>
+        </div>
+    </div>
 
     <!-- SETTINGS MODAL -->
     <div id="settings-modal" class="fixed inset-0 bg-black/80 flex items-center justify-center z-50 backdrop-blur-sm hidden">
@@ -77,7 +124,6 @@
                 <!-- Engine Specific Config -->
                 <div class="bg-gray-800 p-3 rounded-lg border border-gray-700 mb-4">
                     <h3 class="font-bold text-gray-200 text-xs uppercase tracking-wide mb-2">Strategy Risk Config</h3>
-                    <!-- Form Fields -->
                     <div class="grid grid-cols-5 gap-2 mb-2">
                         <div><label class="block text-[9px] font-bold text-gray-400">Risk:Reward</label><input id="inp-rr" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
                         <div><label class="block text-[9px] font-bold text-gray-400">Trailing SL</label><input id="inp-tsl" class="w-full bg-gray-900 border border-gray-600 rounded px-2 h-6 text-xs font-bold text-gray-100"></div>
@@ -218,7 +264,6 @@
         // State
         let activeEngine = null; // 'bull' or 'bear'
         let engineStatus = { bull: true, bear: true };
-        let volumeCriteria = [];
         let blacklisted = new Set();
 
         // --- API HELPERS (WITH MOCK FALLBACK) ---
@@ -270,7 +315,8 @@
                     start_time: '09:15', end_time: '15:15', trades_per_stock: 2,
                     risk_trade_1: 2000, risk_trade_2: 1500, risk_trade_3: 1000,
                     max_profit: 5000, max_loss: 2000, pnl_exit_enabled: false,
-                    volume_criteria: Array.from({length:10}, (_,i)=>({min_vol_price_cr:(i+1)*5, sma_multiplier:2.0, min_sma_avg:50000}))
+                    volume_criteria: Array.from({length:10}, (_,i)=>({min_vol_price_cr:(i+1)*5, sma_multiplier:2.0, min_sma_avg:50000})),
+                    api_key: 'test_key', api_secret: 'test_secret'
                 };
             }
             return {};
@@ -278,10 +324,10 @@
 
         // --- DASHBOARD UPDATES ---
         async function updateDashboard() {
-            // 1. Stats & P&L
+            // 1. Stats & P&L & Sentiment
             const stats = await fetchAPI('/api/stats/');
             if (stats) {
-                // Update P&L Texts
+                // Update P&L
                 const totalPnl = stats.pnl ? stats.pnl.total : 0;
                 document.getElementById('total-pnl').innerText = (totalPnl > 0 ? '+' : '') + totalPnl.toFixed(2);
                 document.getElementById('total-pnl').className = `text-sm ${totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`;
@@ -291,7 +337,7 @@
                     document.getElementById('bear-pnl').innerText = (stats.pnl.bear > 0 ? '+' : '') + stats.pnl.bear.toFixed(2);
                 }
 
-                // Update Heartbeat Dot
+                // Update Heartbeat
                 const dot = document.getElementById('data-dot');
                 const txt = document.getElementById('data-text');
                 if (stats.data_connected) {
@@ -304,25 +350,47 @@
                     txt.innerText = "Disconnected";
                 }
 
-                // Update Engine Switch Visuals
+                // Update Toggle Visuals
                 if(stats.engine_status) {
                     updateToggleVisual('bull', stats.engine_status.bull === "1");
                     updateToggleVisual('bear', stats.engine_status.bear === "1");
                 }
             }
 
-            // 2. Orders
+            // 2. Orders & Scanner
             const orders = await fetchAPI('/api/orders/');
+            const scanner = await fetchAPI('/api/scanner/');
+            
             if (orders) {
                 renderOrders(orders.bull, 'bull-orders-tbody', 'bull-order-count');
                 renderOrders(orders.bear, 'bear-orders-tbody', 'bear-order-count');
             }
-
-            // 3. Scanner
-            const scanner = await fetchAPI('/api/scanner/');
             if (scanner) {
                 renderScanner(scanner.bull, 'bull-scanner-list', 'bull-scan-count');
                 renderScanner(scanner.bear, 'bear-scanner-list', 'bear-scan-count');
+            }
+
+            // CALCULATE SENTIMENT
+            if (scanner) {
+                const bullCount = (scanner.bull || []).length;
+                const bearCount = (scanner.bear || []).length;
+                const total = bullCount + bearCount;
+                const pct = total > 0 ? Math.round((bullCount / total) * 100) : 0;
+                
+                document.getElementById('sentiment-bull-count').innerText = bullCount;
+                document.getElementById('sentiment-bear-count').innerText = bearCount;
+                document.getElementById('sentiment-pct').innerText = `${pct}%`;
+                
+                // Color Logic
+                const icon = document.getElementById('sentiment-icon');
+                const text = document.getElementById('sentiment-pct');
+                if(bullCount >= bearCount) {
+                    icon.className = "w-3 h-3 text-emerald-400";
+                    text.className = "text-sm font-black tracking-tight text-emerald-400";
+                } else {
+                    icon.className = "w-3 h-3 text-rose-400";
+                    text.className = "text-sm font-black tracking-tight text-rose-400";
+                }
             }
         }
 
@@ -438,6 +506,34 @@
             }
         }
 
+        // --- API CREDENTIALS MODAL ---
+        async function openApiModal() {
+            const modal = document.getElementById('api-modal');
+            const data = await fetchAPI('/api/settings/global/');
+            
+            document.getElementById('api-key-input').value = data.api_key || '';
+            document.getElementById('api-secret-input').value = data.api_secret || '';
+            
+            modal.classList.remove('hidden');
+        }
+
+        function closeApiModal() {
+            document.getElementById('api-modal').classList.add('hidden');
+        }
+
+        async function saveApiCredentials() {
+            const key = document.getElementById('api-key-input').value;
+            const secret = document.getElementById('api-secret-input').value;
+            
+            await fetch('/api/settings/global/', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({ api_key: key, api_secret: secret })
+            });
+            
+            alert('Credentials Saved');
+            closeApiModal();
+        }
+
         // --- SETTINGS MODAL ---
         async function openSettings(side) {
             activeEngine = side;
@@ -456,7 +552,6 @@
 
             // Load Data
             const engineData = await fetchAPI(`/api/settings/engine/${side}/`);
-            // Global data is now part of engineData return
             
             // Populate Inputs
             document.getElementById('inp-rr').value = engineData.risk_reward;
@@ -518,6 +613,21 @@
         async function saveSettings() {
             if(!activeEngine) return;
 
+            const enginePayload = {
+                risk_reward: document.getElementById('inp-rr').value,
+                trailing_sl: document.getElementById('inp-tsl').value,
+                total_trades: document.getElementById('inp-max-trades').value,
+                start_time: document.getElementById('inp-start').value,
+                end_time: document.getElementById('inp-end').value,
+                trades_per_stock: document.getElementById('inp-tps').value,
+                risk_trade_1: document.getElementById('inp-r1').value,
+                risk_trade_2: document.getElementById('inp-r2').value,
+                risk_trade_3: document.getElementById('inp-r3').value,
+                max_profit: document.getElementById('inp-max-p').value,
+                max_loss: document.getElementById('inp-max-l').value,
+                pnl_exit_enabled: document.getElementById('inp-pnl-enabled').checked
+            };
+
             const vps = document.querySelectorAll('.vol-inp-vp');
             const smas = document.querySelectorAll('.vol-inp-sma');
             const avgs = document.querySelectorAll('.vol-inp-avg');
@@ -531,21 +641,8 @@
                 });
             });
 
-            const enginePayload = {
-                risk_reward: document.getElementById('inp-rr').value,
-                trailing_sl: document.getElementById('inp-tsl').value,
-                total_trades: document.getElementById('inp-max-trades').value,
-                start_time: document.getElementById('inp-start').value,
-                end_time: document.getElementById('inp-end').value,
-                trades_per_stock: document.getElementById('inp-tps').value,
-                risk_trade_1: document.getElementById('inp-r1').value,
-                risk_trade_2: document.getElementById('inp-r2').value,
-                risk_trade_3: document.getElementById('inp-r3').value,
-                max_profit: document.getElementById('inp-max-p').value,
-                max_loss: document.getElementById('inp-max-l').value,
-                pnl_exit_enabled: document.getElementById('inp-pnl-enabled').checked,
-                volume_criteria: volCriteria 
-            };
+            // Include separate volume criteria
+            enginePayload.volume_criteria = volCriteria;
 
             await fetch(`/api/settings/engine/${activeEngine}/`, {
                 method: 'POST', headers: {'Content-Type':'application/json'},
