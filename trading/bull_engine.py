@@ -290,21 +290,85 @@ class CashBreakoutClient:
             
         return False
 
+    # def _process_candle(self, candle_payload: Dict[str, Any]) -> None:
+    #     symbol = candle_payload.get("symbol")
+    #     if not symbol: return
+
+    #     # INTEGRATION: Check Engine Enabled
+    #     if not self._is_engine_buying_enabled():
+    #         return 
+
+    #     # INTEGRATION: Check Blacklist (Ban)
+    #     if self._is_symbol_blacklisted(symbol):
+    #         return
+
+    #     if redis_client.sismember(self.active_entries_set, symbol): return
+
+    #     # Dynamic Trades Per Stock Check
+    #     bull_settings = self._get_bull_settings()
+    #     max_per_stock = int(bull_settings.get("trades_per_stock", 2))
+        
+    #     symbol_counts = self._get_todays_symbol_counts()
+    #     if symbol_counts.get(symbol, 0) >= max_per_stock: return
+
+    #     prev_high = _get_prev_day_high(redis_client, symbol)
+    #     if not prev_high: return
+
+    #     try:
+    #         low = float(candle_payload.get("low") or 0)
+    #         high = float(candle_payload.get("high") or 0)
+    #         vol = int(candle_payload.get("volume") or 0)
+    #         close = float(candle_payload.get("close") or 0)
+    #         open_p = float(candle_payload.get("open") or 0)
+    #         ts = _parse_candle_ts(candle_payload.get("ts"))
+    #         vol_sma = float(candle_payload.get("vol_sma_375") or 0) # 1875 SMA
+    #         vol_price_cr = float(candle_payload.get("vol_price_cr") or 0)
+    #     except: return
+
+    #     # Strategy Logic: Close > Prev High
+    #     if not (close > open_p): return
+    #     if not (low < prev_high < close): return
+    #     if not (open_p < prev_high): return
+        
+    #     ref = close if close > 0 else 1.0
+    #     if ((high - low) / ref) > BREAKOUT_MAX_CANDLE_PCT: return
+
+    #     # NEW: Global Volume Check (10 Levels)
+    #     if not self._check_volume_criteria(vol, vol_sma, vol_price_cr):
+    #         return
+
+    #     # Register Setup
+    #     rr_mult = _parse_ratio_string(bull_settings.get("risk_reward", "1:2"), 2.0)
+    #     entry = high * (1.0 + ENTRY_OFFSET_PCT)
+    #     stop = low - (low * STOP_OFFSET_PCT)
+        
+    #     # Placeholder target (will be overwritten by _calculate_new_target on entry)
+    #     target = entry + (rr_mult * (entry - stop))
+
+    #     try:
+    #         with transaction.atomic():
+    #             t = CashBreakoutTrade.objects.create(
+    #                 user=self.account.user, account=self.account, symbol=symbol,
+    #                 candle_ts=ts, candle_open=open_p, candle_high=high, candle_low=low, candle_close=close, candle_volume=vol,
+    #                 prev_day_high=prev_high, entry_level=entry, stop_level=stop, target_level=target,
+    #                 volume_price=vol_price_cr, status="PENDING"
+    #             )
+    #             self.pending_trades[symbol] = t
+    #             redis_client.sadd(self.active_entries_set, symbol)
+    #             logger.info(f"CB: Setup Found {symbol} (Est Target: {target:.2f})")
+    #     except Exception as e: logger.error(f"CB: Setup error {symbol}: {e}")
+
+    # ------------------- 2. ENTRY EXECUTION -------------------
+
+    # ------------------- 1. SCANNER (UPDATED FOR SPECIAL CASE) -------------------
     def _process_candle(self, candle_payload: Dict[str, Any]) -> None:
         symbol = candle_payload.get("symbol")
         if not symbol: return
 
-        # INTEGRATION: Check Engine Enabled
-        if not self._is_engine_buying_enabled():
-            return 
-
-        # INTEGRATION: Check Blacklist (Ban)
-        if self._is_symbol_blacklisted(symbol):
-            return
-
+        if not self._is_engine_buying_enabled(): return 
+        if self._is_symbol_blacklisted(symbol): return
         if redis_client.sismember(self.active_entries_set, symbol): return
 
-        # Dynamic Trades Per Stock Check
         bull_settings = self._get_bull_settings()
         max_per_stock = int(bull_settings.get("trades_per_stock", 2))
         
@@ -321,28 +385,56 @@ class CashBreakoutClient:
             close = float(candle_payload.get("close") or 0)
             open_p = float(candle_payload.get("open") or 0)
             ts = _parse_candle_ts(candle_payload.get("ts"))
-            vol_sma = float(candle_payload.get("vol_sma_375") or 0) # 1875 SMA
+            vol_sma = float(candle_payload.get("vol_sma_375") or 0)
             vol_price_cr = float(candle_payload.get("vol_price_cr") or 0)
         except: return
+        # Check Price Floor
+        if close < 100: return # Filter out cheap stocks
 
-        # Strategy Logic: Close > Prev High
+        # BASIC STRATEGY: Close > Open, Close > Prev High
         if not (close > open_p): return
         if not (low < prev_high < close): return
         if not (open_p < prev_high): return
         
-        ref = close if close > 0 else 1.0
-        if ((high - low) / ref) > BREAKOUT_MAX_CANDLE_PCT: return
+        # --- SIZE & STOP LOGIC ---
+        candle_size_pct = 0.0
+        if close > 0:
+            candle_size_pct = (high - low) / close
 
-        # NEW: Global Volume Check (10 Levels)
+        # Default Stop: Candle Low
+        stop_base = low
+
+        # SPECIAL CASE: Large Candle (> 0.7%)
+        if candle_size_pct > BREAKOUT_MAX_CANDLE_PCT:
+            prev_close = _get_prev_day_close(redis_client, symbol)
+            if not prev_close: return # Cannot verify condition without prev close
+
+            # Condition 1: (CandleHigh - PrevClose) <= 3%
+            diff_high_pc_pct = (high - prev_close) / prev_close
+            if diff_high_pc_pct > 0.03: 
+                # logger.info(f"CB: {symbol} Rejected (High-PrevClose > 3%)")
+                return
+
+            # Condition 2: (CandleHigh - PrevHigh) <= 0.5%
+            diff_high_ph_pct = (high - prev_high) / prev_high
+            if diff_high_ph_pct > 0.005:
+                # logger.info(f"CB: {symbol} Rejected (High-PrevHigh > 0.5%)")
+                return
+
+            # If passed, Modify Stop Loss to Prev Day High
+            stop_base = prev_high
+            logger.info(f"CB: {symbol} Special Entry Triggered (SL = Prev High)")
+
+        # Global Volume Check
         if not self._check_volume_criteria(vol, vol_sma, vol_price_cr):
             return
 
         # Register Setup
         rr_mult = _parse_ratio_string(bull_settings.get("risk_reward", "1:2"), 2.0)
         entry = high * (1.0 + ENTRY_OFFSET_PCT)
-        stop = low - (low * STOP_OFFSET_PCT)
+        stop = stop_base - (stop_base * STOP_OFFSET_PCT) # Apply offset to base
         
-        # Placeholder target (will be overwritten by _calculate_new_target on entry)
+        # Placeholder target
         target = entry + (rr_mult * (entry - stop))
 
         try:
@@ -358,7 +450,7 @@ class CashBreakoutClient:
                 logger.info(f"CB: Setup Found {symbol} (Est Target: {target:.2f})")
         except Exception as e: logger.error(f"CB: Setup error {symbol}: {e}")
 
-    # ------------------- 2. ENTRY EXECUTION -------------------
+
     def _try_enter_pending(self) -> None:
         # INTEGRATION: Check Engine Enabled - STRICTLY BLOCK ENTRY
         if not self._is_engine_buying_enabled():

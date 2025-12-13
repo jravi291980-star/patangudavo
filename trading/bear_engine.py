@@ -277,19 +277,15 @@ class CashBreakdownClient:
             except: continue
         return False
 
+    # ------------------- 1. SCANNER (UPDATED FOR SPECIAL CASE) -------------------
     def _process_candle(self, candle_payload: Dict[str, Any]) -> None:
         symbol = candle_payload.get("symbol")
         if not symbol: return
 
-        # CHECK 1: Engine Enabled?
         if not self._is_engine_buying_enabled(): return 
-
-        # CHECK 2: Blacklist?
         if self._is_symbol_blacklisted(symbol): return
-
         if redis_client.sismember(self.active_entries_set, symbol): return
 
-        # Dynamic Trades Per Stock
         bear_settings = self._get_bear_settings()
         max_per_stock = int(bear_settings.get("trades_per_stock", 2))
         if self._get_todays_symbol_counts().get(symbol, 0) >= max_per_stock: return
@@ -304,26 +300,53 @@ class CashBreakdownClient:
             close = float(candle_payload.get("close") or 0)
             open_p = float(candle_payload.get("open") or 0)
             ts = _parse_candle_ts(candle_payload.get("ts"))
-            vol_sma = float(candle_payload.get("vol_sma_375") or 0) # 1875 SMA
+            vol_sma = float(candle_payload.get("vol_sma_375") or 0)
             vol_price_cr = float(candle_payload.get("vol_price_cr") or 0)
         except: return
-
-        # Breakdown Strategy Logic
-        ref = close if close > 0 else 1.0
+        # Check Price Floor
+        if close < 100: return # Filter out cheap stocks
+        # BASIC STRATEGY: Close < Open, Close < Prev Low
         if not (close < open_p): return
         if not (open_p > prev_low > close): return
         if not (low < prev_low): return
-        if ((high - low) / ref) > BREAKDOWN_MAX_CANDLE_PCT: return
+        
+        # --- SIZE & STOP LOGIC ---
+        candle_size_pct = 0.0
+        if close > 0:
+            candle_size_pct = (high - low) / close
 
-        # NEW: Volume Check
+        # Default Stop: Candle High
+        stop_base = high
+
+        # SPECIAL CASE: Large Candle (> 0.7%)
+        if candle_size_pct > BREAKDOWN_MAX_CANDLE_PCT:
+            prev_close = _get_prev_day_close(redis_client, symbol)
+            if not prev_close: return
+
+            # Condition 1: (CandleLow - PrevClose) / PrevClose >= -3%
+            diff_low_pc_pct = (low - prev_close) / prev_close
+            if diff_low_pc_pct < -0.03: 
+                # logger.info(f"CBD: {symbol} Rejected (Low-PrevClose < -3%)")
+                return
+
+            # Condition 2: (CandleLow - PrevLow) / PrevLow >= -0.5%
+            diff_low_pl_pct = (low - prev_low) / prev_low
+            if diff_low_pl_pct < -0.005:
+                # logger.info(f"CBD: {symbol} Rejected (Low-PrevLow < -0.5%)")
+                return
+
+            # If passed, Modify Stop Loss to Prev Day Low
+            stop_base = prev_low
+            logger.info(f"CBD: {symbol} Special Entry Triggered (SL = Prev Low)")
+
+        # Global Volume Check
         if not self._check_volume_criteria(vol, vol_sma, vol_price_cr): return
 
         # Register Setup
         rr_mult = _parse_ratio_string(bear_settings.get("risk_reward", "1:2"), 2.0)
         entry = low * (1.0 - ENTRY_OFFSET_PCT)
-        stop = high + (high * STOP_OFFSET_PCT)
+        stop = stop_base + (stop_base * STOP_OFFSET_PCT) # Apply offset
         
-        # Placeholder target (overwritten on entry)
         risk = stop - entry
         target = entry - (rr_mult * risk)
 
