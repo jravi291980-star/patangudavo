@@ -1,19 +1,19 @@
 import logging
 import json
+import time # Added for rate-limiting between batches
 from django.core.management.base import BaseCommand
 from kiteconnect import exceptions as kite_exceptions
 
 # Assuming these imports exist in your project structure
 from trading.models import Account
-from trading.utils import get_kite
+from trading.utils import get_kite 
 
 logger = logging.getLogger(__name__)
 
 class Command(BaseCommand):
-    help = 'Fetches LTP for a list of symbols and filters out those trading below 50.0.'
+    help = 'Fetches LTP for a list of symbols in batches and filters out those trading below 50.0.'
 
-    # --- DEFINE TARGET SYMBOLS HERE ---
-    # You can customize this list or import it from settings if available.
+    # --- DEFINE TARGET SYMBOLS HERE (864 Symbols) ---
     TARGET_SYMBOLS = [
         "20MICRONS","21STCENMGM","360ONE","3IINFOLTD","3MINDIA","3PLAND","5PAISA","63MOONS","A2ZINFRA","AAATECH",
         "AADHARHFC","AAKASH","AAREYDRUGS","AARON","AARTECH","AARTIDRUGS","AARTIIND","AARTIPHARM","AARTISURF","AARVI",
@@ -24,7 +24,7 @@ class Command(BaseCommand):
         "AEROFLEX","AERONEU","AETHER","AFCONS","AFFLE","AFFORDABLE","AFIL","AFSL","AGARIND","AGARWALEYE",
         "AGI","AGIIL","AGRITECH","AGROPHOS","AGSTRA","AHCL","AHLADA","AHLEAST","AHLUCONT","AIAENG",
         "AIIL","AIRAN","AIROLAM","AJANTPHARM","AJAXENGG","AJMERA","AJOONI","AKASH","AKG","AKI",
-        "AKSHAR","AKSHARCHEM","AKSHOPTFBR","AKUMS","AKZOINDIA","ALANKIT","ALBERTDAVD","ALEMBICLTD","ALICON","ALIVUS",
+        "AKSHAR","AKSHARCHEM","AKSHOPTFBR","AKSHOPTFBR","AKUMS","AKZOINDIA","ALANKIT","ALBERTDAVD","ALEMBICLTD","ALICON","ALIVUS",
         "ALKALI","ALKEM","ALKYLAMINE","ALLCARGO","ALLDIGI","ALLTIME","ALMONDZ","ALOKINDS","ALPA","ALPHAGEO",
         "ALPSINDUS","AMANTA","AMBER","AMBICAAGAR","AMBIKCO","AMBUJACEM","AMDIND","AMJLAND","AMNPLST","AMRUTANJAN",
         "ANANDRATHI","ANANTRAJ","ANDHRAPAP","ANDHRSUGAR","ANGELONE","ANIKINDS","ANKITMETAL","ANMOL","ANSALAPI","ANTELOPUS",
@@ -183,7 +183,7 @@ class Command(BaseCommand):
         "RPPL","RPSGVENT","RPTECH","RRKABEL","RSSOFTWARE","RSWM","RSYSTEMS","RTNINDIA","RTNPOWER","RUBFILA",
         "RUBICON","RUBYMILLS","RUCHINFRA","RUCHIRA","RUPA","RUSHIL","RUSTOMJEE","RVHL","RVNL","RVTH",
         "S&SPOWER","SAATVIKGL","SABEVENTS","SABTNL","SADBHAV","SADBHIN","SADHNANIQ","SAFARI","SAGARDEEP","SAGCEM",
-        "SAGILITY","SAHYADRI","SAIL","SAILIFE","SAKAR","SAKHTISUG","SAKSOFT","SAKUMA","SALASAR","SALONA",
+        "SAGILITY","SAHYADRI","SAIL","SAILIFE","SAKAR","SAKHTISUGAR","SAKSOFT","SAKUMA","SALASAR","SALONA",
         "SALSTEEL","SALZERELEC","SAMBHA AV","SAMBHV","SAMHI","SAMMAANCAP","SAMPANN","SANATHAN","SANCO","SANDESH",
         "SANDHAR","SANDUMA","SANGAMIND","SANGHIIND","SANGHVIMOV","SANGINITA","SANOFI","SANOFICONR","SANSERA","SANSTAR",
         "SANWARIA","SAPPHIRE","SARDAEN","SAREGAMA","SARLAPOLY","SARVESHWAR","SASKEN","SASTASUNDR","SATIA","SATIN",
@@ -239,11 +239,12 @@ class Command(BaseCommand):
         "ZFCVINDIA","ZIMLAB","ZODIAC","ZODIACLOTH","ZOTA","ZUARI","ZUARIIND","ZYDUSLIFE","ZYDUSWELL"
     ]
     
-    
     LTP_THRESHOLD = 50.0
-    
+    BATCH_SIZE = 100 # Maximum symbols per Kite API call
+
     def handle(self, *args, **options):
         self.stdout.write(f"--- Starting LTP Filter (Threshold: ₹{self.LTP_THRESHOLD}) ---")
+        self.stdout.write(f"Total symbols to check: {len(self.TARGET_SYMBOLS)}")
 
         master_account = Account.objects.filter(is_master=True, user__is_superuser=True).first()
         if not master_account:
@@ -255,30 +256,45 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(self.style.ERROR(f"Error initializing Kite: {e}"))
             return
-
-        # 1. Prepare symbols for Kite API
-        # Kite requires symbols in 'EXCHANGE:SYMBOL' format (e.g., 'NSE:ITC')
-        kite_symbols = [f"NSE:{symbol}" for symbol in self.TARGET_SYMBOLS]
         
-        # 2. Fetch Quotes
-        self.stdout.write(f"Fetching quotes for {len(self.TARGET_SYMBOLS)} symbols...")
-        quote_data = {}
-        try:
-            quote_data = kite.quote(kite_symbols)
-        except kite_exceptions.InputException as e:
-            self.stdout.write(self.style.ERROR(f"Kite Input Error (Check symbols): {e}"))
-            return
-        except Exception as e:
-            self.stdout.write(self.style.ERROR(f"Kite API Error: {e}"))
-            return
+        all_quote_data = {}
+        total_symbols = len(self.TARGET_SYMBOLS)
+        
+        # --- BATCHING LOGIC IMPLEMENTED HERE ---
+        
+        for i in range(0, total_symbols, self.BATCH_SIZE):
+            batch_symbols = self.TARGET_SYMBOLS[i:i + self.BATCH_SIZE]
+            kite_symbols = [f"NSE:{symbol}" for symbol in batch_symbols]
+            
+            self.stdout.write(f"Fetching Batch {i//self.BATCH_SIZE + 1} of {total_symbols//self.BATCH_SIZE + 1} ({len(batch_symbols)} symbols)...")
 
+            try:
+                # Fetch quotes for the current batch
+                batch_quote = kite.quote(kite_symbols)
+                all_quote_data.update(batch_quote)
+                
+                # Rate limit safety
+                time.sleep(0.5) 
+
+            except kite_exceptions.InputException as e:
+                self.stdout.write(self.style.ERROR(f"Kite Input Error in batch {i//self.BATCH_SIZE + 1}: {e}"))
+                logger.error(f"Kite Input Error in batch {i//self.BATCH_SIZE + 1}: {e}")
+                
+            except Exception as e:
+                # Catching any other Kite API error (Network, Timeout, etc.)
+                self.stdout.write(self.style.ERROR(f"Kite API Error in batch {i//self.BATCH_SIZE + 1}: {e}"))
+                logger.error(f"Kite API Error in batch {i//self.BATCH_SIZE + 1}: {e}")
+                
+
+        # ---------------------------------------
+        
         filtered_symbols = []
         
-        # 3. Process and Filter Data
-        for kite_key, data in quote_data.items():
-            # Extract the pure symbol (e.g., "ITC" from "NSE:ITC")
+        # 3. Process and Filter Collected Data
+        self.stdout.write(f"\nProcessing {len(all_quote_data)} successfully fetched quotes.")
+        
+        for kite_key, data in all_quote_data.items():
             symbol = kite_key.split(':')[-1]
-            
             ltp = data.get('last_price', 0.0)
             
             if ltp is None or ltp == 0.0:
@@ -288,21 +304,19 @@ class Command(BaseCommand):
             if ltp >= self.LTP_THRESHOLD:
                 filtered_symbols.append((symbol, ltp))
             else:
-                self.stdout.write(f"Filtered out {symbol}: LTP is {ltp:.2f} (Below threshold).")
+                self.stdout.write(f"Filtered out {symbol.ljust(15)}: LTP is {ltp:.2f} (Below threshold).")
 
         # 4. Print Results
         if filtered_symbols:
-            self.stdout.write(self.style.SUCCESS("\n--- FILTERED SYMBOL LIST (LTP >= 50.0) ---"))
+            self.stdout.write(self.style.SUCCESS("\n--- FILTERED SYMBOL LIST (LTP >= ₹50.0) ---"))
             
-            # Sort by LTP (optional, but helpful)
             filtered_symbols.sort(key=lambda x: x[1], reverse=True)
             
             for symbol, ltp in filtered_symbols:
-                self.stdout.write(f"{symbol.ljust(15)}: ₹{ltp:.2f}")
+                self.stdout.write(f"{symbol.ljust(15)}: ₹{ltp:,.2f}")
 
-            # Print the final list of names for easy copying
             final_names = [s[0] for s in filtered_symbols]
-            self.stdout.write(self.style.SUCCESS("\nFinal Filtered Symbol Names:"))
+            self.stdout.write(self.style.SUCCESS("\nFinal Filtered Symbol Names (List format):"))
             self.stdout.write(str(final_names))
 
         else:
