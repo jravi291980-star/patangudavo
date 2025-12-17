@@ -25,12 +25,12 @@ ALLOWED_HOSTS = [
     '134.195.138.175', 
     'localhost', 
     '127.0.0.1', 
-    'rocky-beach-98529-61db31213b6a.herokuapp.com',
+    'patangudavojamke-5aa91e6eaa02.herokuapp.com',
 ]
 CSRF_TRUSTED_ORIGINS = [
     'http://134.195.138.175',
     'https://134.195.138.175',
-    'https://rocky-beach-98529-61db31213b6a.herokuapp.com'
+    'https://patangudavojamke-5aa91e6eaa02.herokuapp.com',
 ]
 
 SECURE_SSL_REDIRECT = False
