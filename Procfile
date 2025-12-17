@@ -1,2 +1,3 @@
 web: gunicorn algotrader.wsgi --log-file -
-worker: python manage.py run_algo
+data: python manage.py run_data
+strategy: python manage.py run_strategies

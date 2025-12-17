@@ -1,9 +1,10 @@
 """
 CashBreakout Client (Long Buy Engine) - Final Production Version
-- Target is RECALCULATED based on Actual Executed Price (Demat Account).
-- Fully Integrated with React Frontend Controls.
-- Handles Blacklist (Ban), Engine Toggle, and Panic Exit.
-- Implements STEP-BASED (Ladder) Trailing SL and 10-Level Volume Logic.
+- ARCHITECTURE: Multi-Process, Redis Streams, In-Memory Caching.
+- OPTIMIZATION: Fail-Fast Logic (CPU -> RAM -> Redis -> DB).
+- SETTINGS: Cached in RAM (Updates every 5s).
+- LOGGING: Detailed 'Smart Logging' (Throttled to prevents disk overflow).
+- DATA: 'tick_stream' for Execution (No Stale Checks), 'candle_1m' for Scanning.
 """
 
 import json
@@ -11,13 +12,12 @@ import time
 import logging
 import threading
 from math import floor
-from datetime import datetime as dt, timedelta, date, time as dt_time
-from typing import Dict, Optional, Any, List
+from datetime import datetime as dt, time as dt_time, timedelta
+from typing import Dict, Any
 
 import pytz
 import redis
-from django.db import transaction, models
-from django.utils import timezone
+from django.db import transaction, models, close_old_connections
 from django.conf import settings
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 from kiteconnect.exceptions import TokenException
@@ -29,60 +29,55 @@ logger = logging.getLogger(__name__)
 IST = pytz.timezone("Asia/Kolkata")
 redis_client = get_redis_connection()
 
-# ---------------------------------------------------------------------------
-# Redis Keys (Must match Django Views/Frontend)
-# ---------------------------------------------------------------------------
+# --- REDIS KEYS ---
 CANDLE_STREAM_KEY = getattr(settings, "BREAKOUT_CANDLE_STREAM", "candle_1m")
+TICK_STREAM_KEY = "tick_stream"
 LIVE_OHLC_KEY = getattr(settings, "BREAKOUT_LIVE_OHLC_KEY", "live_ohlc_data")
 PREV_DAY_HASH = getattr(settings, "BREAKOUT_PREV_DAY_HASH", "prev_day_ohlc")
 
-# Settings Keys (Written by Frontend)
-KEY_GLOBAL_SETTINGS = "algo:settings:global"
 KEY_BULL_SETTINGS = "algo:settings:bull"
+KEY_BLACKLIST = "algo:blacklist"
+KEY_ENGINE_ENABLED = "algo:engine:bull:enabled"
+KEY_PANIC_TRIGGER = "algo:panic:bull"
 
-# Operational Control Keys (Written by Frontend)
-KEY_BLACKLIST = "algo:blacklist"                # Redis Set of banned symbols
-KEY_ENGINE_ENABLED = "algo:engine:bull:enabled" # String "1" (ON) or "0" (OFF)
-KEY_PANIC_TRIGGER = "algo:panic:bull"           # Exists if panic button pressed
-
-# Constants
 ENTRY_OFFSET_PCT = 0.0001
 STOP_OFFSET_PCT = 0.0002
 BREAKOUT_MAX_CANDLE_PCT = 0.007
 MAX_MONITORING_MINUTES = 6 
-RECONCILE_SLEEP_PER_CALL = 0.2
 
-# ---------------------------------------------------------------------------
-# Helper functions
-# ---------------------------------------------------------------------------
+# --- HELPER FUNCTIONS ---
 
-def _get_prev_day_high(redis_conn: redis.Redis, symbol: str) -> Optional[float]:
+def _get_prev_day_high(redis_conn, symbol):
+    """Fetches Prev Day High from Redis Hash."""
     try:
         raw = redis_conn.hget(PREV_DAY_HASH, symbol)
-        if not raw: return None
-        if isinstance(raw, bytes): raw = raw.decode('utf-8')
-        parsed = json.loads(raw)
-        return float(parsed.get("high"))
-    except: return None
+        if raw: return float(json.loads(raw).get("high"))
+    except: pass
+    return None
 
-def _parse_candle_ts(ts_str: Optional[str]) -> dt:
-    if not ts_str: return timezone.now()
+def _get_prev_day_close(redis_conn, symbol):
+    """Fetches Prev Day Close from Redis Hash."""
     try:
-        dt_obj = dt.fromisoformat(ts_str)
-        if dt_obj.tzinfo is None: return IST.localize(dt_obj)
-        return dt_obj.astimezone(IST)
-    except: return timezone.now()
+        raw = redis_conn.hget(PREV_DAY_HASH, symbol)
+        if raw: return float(json.loads(raw).get("close", 0.0))
+    except: pass
+    return None
 
-def _parse_ratio_string(ratio_str: str, default: float) -> float:
-    """Parses '1:2' or '1:1.5' into float 2.0 or 1.5"""
+def _parse_candle_ts(ts_str):
+    """Parses timestamp string to IST datetime."""
+    if not ts_str: return dt.now(IST)
     try:
-        if not ratio_str or ':' not in ratio_str: return default
-        return float(ratio_str.split(':')[1])
+        d = dt.fromisoformat(ts_str)
+        if d.tzinfo is None: return IST.localize(d)
+        return d.astimezone(IST)
+    except: return dt.now(IST)
+
+def _parse_ratio_string(ratio_str, default):
+    """Parses '1:2' to 2.0."""
+    try: return float(ratio_str.split(':')[1])
     except: return default
 
-# ---------------------------------------------------------------------------
-# Main Client Class
-# ---------------------------------------------------------------------------
+# --- MAIN ENGINE CLASS ---
 
 class CashBreakoutClient:
     DAILY_RESET_TIME = dt_time(20, 0, 0)
@@ -91,14 +86,24 @@ class CashBreakoutClient:
         self.account = account
         self.kite = get_kite(account)
         self.running = True
-        self.last_reconcile_time = time.time()
-        self.open_trades: Dict[str, CashBreakoutTrade] = {}
-        self.pending_trades: Dict[str, CashBreakoutTrade] = {}
         
+        self.open_trades = {}
+        self.pending_trades = {}
+        self.latest_prices = {} 
+
         self.group_name = f"CB_GROUP:{self.account.id}"
         self.consumer_name = f"CB_CONSUMER:{threading.get_ident()}" 
+        
+        # --- RAM CACHE (Zero Latency) ---
+        self.cached_settings = {}
+        self.cached_blacklist = set()
+        self.cached_engine_enabled = True
+        self.last_cache_update = 0
+        
+        # Logging Throttle Map: {'SYMBOL': timestamp}
+        self.log_throttle = {}
 
-        # Redis keys
+        # Redis Keys
         today_iso = dt.now(IST).date().isoformat()
         self.limit_reached_key = f"breakout_limit_reached:{self.account.id}:{today_iso}"
         self.trade_count_key = f"breakout_trade_count:{self.account.id}:{today_iso}"
@@ -108,334 +113,195 @@ class CashBreakoutClient:
         self.entry_lock_key_prefix = f"cb_entry_lock:{self.account.id}"
         self.daily_pnl_key = f"cb_daily_realized_pnl:{self.account.id}:{today_iso}"
 
-        if not redis_client:
-            self.running = False; return
-
-        # Initialize Stream
-        try: redis_client.xgroup_create(CANDLE_STREAM_KEY, self.group_name, id='0', mkstream=True)
-        except: pass
-
+        if not redis_client: self.running = False; return
+        
+        # Ensure Groups Exist
+        self._ensure_consumer_group(CANDLE_STREAM_KEY, '0')
+        self._ensure_consumer_group(TICK_STREAM_KEY, '$')
+        
+        self._prefill_prices()
         self._load_trades_from_db()
+        self._update_global_cache(force=True)
 
-    # ------------------- Daily housekeeping -------------------
-    def _daily_reset_trades(self) -> None:
-        """Reset DB + Redis state once per day after DAILY_RESET_TIME."""
-        now_ist = dt.now(IST)
-        reset_time_passed = now_ist.time() >= self.DAILY_RESET_TIME
-
-        target_reset_date = now_ist.date()
-        if now_ist.time() < dt_time(0, 30):
-            target_reset_date = now_ist.date() - timedelta(days=1)
-
-        reset_flag_key = f"cbd_daily_reset_done:{self.account.id}:{target_reset_date.isoformat()}"
-
-        if reset_time_passed and redis_client.set(reset_flag_key, "1", nx=True, ex=86400 * 2):
-            logger.warning("CB(%s): Performing daily reset for date=%s", self.account.user.username, target_reset_date)
-            try:
-                # Optional: Archive trades instead of delete if you want history
-                # CashBreakoutTrade.objects.filter(account=self.account).delete()
-                
-                with redis_client.pipeline() as pipe:
-                    pipe.delete(self.trade_count_key)
-                    pipe.delete(self.limit_reached_key)
-                    pipe.delete(self.active_entries_set)
-                    pipe.delete(self.exiting_trades_set)
-                    pipe.delete(self.daily_pnl_key)
-                    for key in redis_client.keys(f"{self.entry_lock_key_prefix}:*"):
-                        pipe.delete(key)
-                    pipe.execute()
-
-                self.open_trades.clear()
-                self.pending_trades.clear()
-                logger.info("CB(%s): Daily reset complete.", self.account.user.username)
-            except Exception as e:
-                logger.critical("CB(%s): Daily reset failed: %s", self.account.user.username, e, exc_info=True)
-                redis_client.delete(reset_flag_key)
-
-    # ------------------- Settings & Status Fetching -------------------
-    def _get_global_settings(self) -> Dict[str, Any]:
-        """Fetch global volume criteria from Redis."""
+    def _ensure_consumer_group(self, stream_key, start_id='$'):
+        """Creates the consumer group if it does not exist (Idempotent)."""
         try:
-            data = redis_client.get(KEY_GLOBAL_SETTINGS)
-            if data: return json.loads(data)
-        except: pass
-        return {"volume_criteria": []}
+            redis_client.xgroup_create(stream_key, self.group_name, id=start_id, mkstream=True)
+            logger.info(f"CB: Verified consumer group {self.group_name} for {stream_key}")
+        except redis.exceptions.ResponseError as e:
+            if "BUSYGROUP" not in str(e): logger.error(f"CB: Failed group {stream_key}: {e}")
+        except Exception: pass
 
-    def _get_bull_settings(self) -> Dict[str, Any]:
-        """Fetch Risk/Reward settings from Redis."""
-        try:
-            data = redis_client.get(KEY_BULL_SETTINGS)
-            if data: return json.loads(data)
-        except: pass
-        return {}
-
-    def _is_engine_buying_enabled(self) -> bool:
-        """Checks if the 'Power Button' on the frontend is ON."""
-        try:
-            val = redis_client.get(KEY_ENGINE_ENABLED)
-            if val is None: return True 
-            return val.decode('utf-8') == "1"
-        except: return True
-
-    def _is_symbol_blacklisted(self, symbol: str) -> bool:
-        """Checks if the 'Ban' button was clicked for this symbol."""
-        try:
-            return redis_client.sismember(KEY_BLACKLIST, symbol)
-        except: return False
-
-    # ------------------- DB Sync -------------------
-    def _sync_state_from_db(self) -> None:
-        try:
-            today_start = IST.localize(dt.combine(dt.now(IST).date(), dt_time.min))
-            daily_count = CashBreakoutTrade.objects.filter(
-                account=self.account, created_at__gte=today_start,
-                status__in=['PENDING_ENTRY', 'OPEN', 'PENDING_EXIT', 'CLOSED']
-            ).count()
-            redis_client.set(self.trade_count_key, daily_count)
-            redis_client.expire(self.trade_count_key, 86400)
-        except: pass
-
-    def _load_trades_from_db(self) -> None:
-        try:
-            active_db = CashBreakoutTrade.objects.filter(
-                account=self.account,
-                status__in=["OPEN", "PENDING_EXIT", "PENDING", "PENDING_ENTRY"],
-            )
-            self.open_trades.clear()
-            self.pending_trades.clear()
-            symbols_to_monitor = []
-            exiting_ids = []
-
-            for trade in active_db:
-                symbols_to_monitor.append(trade.symbol)
-                if trade.status in ("OPEN", "PENDING_EXIT"): self.open_trades[trade.symbol] = trade
-                if trade.status == "PENDING": self.pending_trades[trade.symbol] = trade
-                if trade.status == "PENDING_EXIT": exiting_ids.append(trade.id)
-
-            with redis_client.pipeline() as pipe:
-                pipe.delete(self.active_entries_set)
-                pipe.delete(self.exiting_trades_set)
-                if symbols_to_monitor: pipe.sadd(self.active_entries_set, *symbols_to_monitor)
-                if exiting_ids: pipe.sadd(self.exiting_trades_set, *exiting_ids)
-                pipe.execute()
-            self._sync_state_from_db()
-        except: pass
-
-    def _get_todays_symbol_counts(self) -> Dict[str, int]:
-        today_start = IST.localize(dt.combine(dt.now(IST).date(), dt_time.min))
-        qs = CashBreakoutTrade.objects.filter(account=self.account, created_at__gte=today_start, status__in=['PENDING_ENTRY', 'OPEN', 'PENDING_EXIT', 'CLOSED'])
-        counts = qs.values("symbol").annotate(count=models.Count("symbol"))
-        return {item["symbol"]: item["count"] for item in counts}
-
-    def _get_live_ohlc(self) -> Dict[str, Any]:
+    def _prefill_prices(self):
+        """Loads snapshot to avoid 0 prices at startup."""
         try:
             raw = redis_client.get(LIVE_OHLC_KEY)
-            if isinstance(raw, bytes): raw = raw.decode('utf-8')
-            return json.loads(raw) if raw else {}
-        except: return {}
+            if raw:
+                data = json.loads(raw)
+                now = dt.now(IST)
+                for sym, info in data.items():
+                    self.latest_prices[sym] = {'ltp': float(info.get('ltp', 0)), 'ts': now}
+            logger.info(f"CB: Prefilled prices for {len(self.latest_prices)} symbols.")
+        except: pass
 
-    # ------------------- Risk / Order Logic -------------------
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=0.1), retry=retry_if_not_exception_type(TokenException))
-    def _check_and_increment_trade_count(self) -> bool:
-        settings = self._get_bull_settings()
+    def _update_global_cache(self, force=False):
+        """Fetches Settings, Blacklist, and Status every 5 seconds (Low I/O)."""
+        if force or (time.time() - self.last_cache_update > 5):
+            try:
+                # 1. Settings
+                data = redis_client.get(KEY_BULL_SETTINGS)
+                self.cached_settings = json.loads(data) if data else {}
+                
+                # 2. Blacklist (Set)
+                bl = redis_client.smembers(KEY_BLACKLIST)
+                self.cached_blacklist = {b.decode('utf-8') for b in bl} if bl else set()
+                
+                # 3. Engine Enabled
+                status = redis_client.get(KEY_ENGINE_ENABLED)
+                self.cached_engine_enabled = (status.decode('utf-8') == "1") if status else True
+                
+                self.last_cache_update = time.time()
+            except: pass
+
+    def _smart_log(self, symbol, message):
+        """Logs a message only if 5 seconds have passed since the last log for this symbol."""
+        now = time.time()
+        if now - self.log_throttle.get(symbol, 0) > 5:
+            logger.info(message)
+            self.log_throttle[symbol] = now
+
+    def _daily_reset_trades(self):
+        now_ist = dt.now(IST)
+        if now_ist.time() >= self.DAILY_RESET_TIME:
+            reset_flag = f"cbd_reset:{now_ist.date()}"
+            if redis_client.set(reset_flag, "1", nx=True, ex=86400):
+                self.open_trades.clear(); self.pending_trades.clear()
+                redis_client.delete(self.trade_count_key, self.limit_reached_key, self.active_entries_set, self.exiting_trades_set, self.daily_pnl_key)
+
+    def _load_trades_from_db(self):
+        try:
+            close_old_connections()
+            today_start = IST.localize(dt.combine(dt.now(IST).date(), dt_time.min))
+            qs = CashBreakoutTrade.objects.filter(account=self.account, created_at__gte=today_start, status__in=['OPEN', 'PENDING', 'PENDING_ENTRY', 'PENDING_EXIT'])
+            self.open_trades.clear(); self.pending_trades.clear()
+            active_syms = []
+            for t in qs:
+                active_syms.append(t.symbol)
+                if t.status == 'PENDING': self.pending_trades[t.symbol] = t
+                elif t.status in ['OPEN', 'PENDING_EXIT']: self.open_trades[t.symbol] = t
+            if active_syms: redis_client.sadd(self.active_entries_set, *active_syms)
+        except: pass
+
+    def _get_todays_symbol_counts(self):
+        today_start = IST.localize(dt.combine(dt.now(IST).date(), dt_time.min))
+        qs = CashBreakoutTrade.objects.filter(account=self.account, created_at__gte=today_start).exclude(status__in=['FAILED_ENTRY', 'EXPIRED'])
+        return {x['symbol']: x['count'] for x in qs.values('symbol').annotate(count=models.Count('symbol'))}
+
+    def _check_and_increment_trade_count(self):
+        settings = self.cached_settings
         max_trades = int(settings.get("total_trades", 5))
-        lua_script = """
-        local c = tonumber(redis.call('GET', KEYS[1]) or 0)
-        if c >= tonumber(ARGV[1]) then return 0 end
-        redis.call('INCR', KEYS[1]); redis.call('EXPIRE', KEYS[1], 86400); return 1
-        """
-        try: return bool(redis_client.eval(lua_script, 1, self.trade_count_key, max_trades))
+        lua = "local c=tonumber(redis.call('GET',KEYS[1]) or 0); if c>=tonumber(ARGV[1]) then return 0 end; redis.call('INCR',KEYS[1]); redis.call('EXPIRE',KEYS[1],86400); return 1"
+        try: return bool(redis_client.eval(lua, 1, self.trade_count_key, max_trades))
         except: return False
 
-    def _calculate_quantity(self, entry_price: float, sl_price: float) -> int:
-        """Applies Tiered Risk (Trade 1 vs Trade 2 vs Trade 3) logic."""
+    def _calculate_quantity(self, entry_price, sl_price):
         try:
-            current_trade_count = int(redis_client.get(self.trade_count_key) or 0)
-            tier = min(current_trade_count + 1, 3)
-            settings = self._get_bull_settings()
-            max_loss = float(settings.get(f"risk_trade_{tier}", 1000))
+            cnt = int(redis_client.get(self.trade_count_key) or 0)
+            settings = self.cached_settings
+            # Fallback to general risk if tiered risk is missing
+            max_loss = float(settings.get(f"risk_trade_{min(cnt+1,3)}") or settings.get("risk_per_trade") or 1000)
         except: max_loss = 1000.0
-
         risk = abs(entry_price - sl_price)
-        if risk <= 0.001: return 0
+        if risk <= 0: return 0
         return max(0, int(floor(max_loss / risk)))
 
     def _place_order(self, symbol, qty, txn_type):
         return self.kite.place_order(tradingsymbol=symbol, quantity=qty, transaction_type=txn_type, product=self.kite.PRODUCT_MIS, order_type=self.kite.ORDER_TYPE_MARKET, exchange=self.kite.EXCHANGE_NSE, variety=self.kite.VARIETY_REGULAR)
 
-    # ------------------- 1. SCANNER (Process Candle) -------------------
-    
-    # --- UPDATED: 10-Level Volume Logic with Min Avg SMA ---
     def _check_volume_criteria(self, vol, vol_sma, vol_price_cr):
-        """
-        Checks if volume meets ANY of the 10 configured levels.
-        Each level: (Vol*Price > Min) AND (Vol > SMA * Multiplier) AND (SMA > Min_SMA_Avg)
-        """
-        settings = self._get_bull_settings()
-        criteria_list = settings.get("volume_criteria", [])
-        
-        # If no settings, return False (safety)
-        if not criteria_list: return False
-
-        for level in criteria_list:
+        # Uses RAM Cached Settings (Instant)
+        criteria = self.cached_settings.get("volume_criteria", [])
+        if not criteria: return False
+        for c in criteria:
             try:
-                min_vp = float(level.get('min_vol_price_cr', 999999))
-                sma_mult = float(level.get('sma_multiplier', 99))
-                min_sma_avg = float(level.get('min_sma_avg', 0))
-
-                if vol_price_cr >= min_vp:
-                    if vol_sma >= min_sma_avg and vol >= (vol_sma * sma_mult):
+                if vol_price_cr >= float(c.get('min_vol_price_cr', 999999)):
+                    if vol_sma >= float(c.get('min_sma_avg', 0)) and vol >= (vol_sma * float(c.get('sma_multiplier', 99))):
                         return True
             except: continue
-            
         return False
 
-    # def _process_candle(self, candle_payload: Dict[str, Any]) -> None:
-    #     symbol = candle_payload.get("symbol")
-    #     if not symbol: return
-
-    #     # INTEGRATION: Check Engine Enabled
-    #     if not self._is_engine_buying_enabled():
-    #         return 
-
-    #     # INTEGRATION: Check Blacklist (Ban)
-    #     if self._is_symbol_blacklisted(symbol):
-    #         return
-
-    #     if redis_client.sismember(self.active_entries_set, symbol): return
-
-    #     # Dynamic Trades Per Stock Check
-    #     bull_settings = self._get_bull_settings()
-    #     max_per_stock = int(bull_settings.get("trades_per_stock", 2))
-        
-    #     symbol_counts = self._get_todays_symbol_counts()
-    #     if symbol_counts.get(symbol, 0) >= max_per_stock: return
-
-    #     prev_high = _get_prev_day_high(redis_client, symbol)
-    #     if not prev_high: return
-
-    #     try:
-    #         low = float(candle_payload.get("low") or 0)
-    #         high = float(candle_payload.get("high") or 0)
-    #         vol = int(candle_payload.get("volume") or 0)
-    #         close = float(candle_payload.get("close") or 0)
-    #         open_p = float(candle_payload.get("open") or 0)
-    #         ts = _parse_candle_ts(candle_payload.get("ts"))
-    #         vol_sma = float(candle_payload.get("vol_sma_375") or 0) # 1875 SMA
-    #         vol_price_cr = float(candle_payload.get("vol_price_cr") or 0)
-    #     except: return
-
-    #     # Strategy Logic: Close > Prev High
-    #     if not (close > open_p): return
-    #     if not (low < prev_high < close): return
-    #     if not (open_p < prev_high): return
-        
-    #     ref = close if close > 0 else 1.0
-    #     if ((high - low) / ref) > BREAKOUT_MAX_CANDLE_PCT: return
-
-    #     # NEW: Global Volume Check (10 Levels)
-    #     if not self._check_volume_criteria(vol, vol_sma, vol_price_cr):
-    #         return
-
-    #     # Register Setup
-    #     rr_mult = _parse_ratio_string(bull_settings.get("risk_reward", "1:2"), 2.0)
-    #     entry = high * (1.0 + ENTRY_OFFSET_PCT)
-    #     stop = low - (low * STOP_OFFSET_PCT)
-        
-    #     # Placeholder target (will be overwritten by _calculate_new_target on entry)
-    #     target = entry + (rr_mult * (entry - stop))
-
-    #     try:
-    #         with transaction.atomic():
-    #             t = CashBreakoutTrade.objects.create(
-    #                 user=self.account.user, account=self.account, symbol=symbol,
-    #                 candle_ts=ts, candle_open=open_p, candle_high=high, candle_low=low, candle_close=close, candle_volume=vol,
-    #                 prev_day_high=prev_high, entry_level=entry, stop_level=stop, target_level=target,
-    #                 volume_price=vol_price_cr, status="PENDING"
-    #             )
-    #             self.pending_trades[symbol] = t
-    #             redis_client.sadd(self.active_entries_set, symbol)
-    #             logger.info(f"CB: Setup Found {symbol} (Est Target: {target:.2f})")
-    #     except Exception as e: logger.error(f"CB: Setup error {symbol}: {e}")
-
-    # ------------------- 2. ENTRY EXECUTION -------------------
-
-    # ------------------- 1. SCANNER (UPDATED FOR SPECIAL CASE) -------------------
     def _process_candle(self, candle_payload: Dict[str, Any]) -> None:
+        """
+        FAIL-FAST SCANNER LOGIC:
+        1. Freshness & Global Switch (Instant)
+        2. JSON Parse (Microseconds)
+        3. Price Structure & Volume Check (Instant CPU) -> Filters 99%
+        4. RAM Blacklist (Instant)
+        5. Redis Checks (Network I/O)
+        6. DB Checks (Slowest I/O)
+        """
         symbol = candle_payload.get("symbol")
         if not symbol: return
-
-        if not self._is_engine_buying_enabled(): return 
-        if self._is_symbol_blacklisted(symbol): return
-        if redis_client.sismember(self.active_entries_set, symbol): return
-
-        bull_settings = self._get_bull_settings()
-        max_per_stock = int(bull_settings.get("trades_per_stock", 2))
         
-        symbol_counts = self._get_todays_symbol_counts()
-        if symbol_counts.get(symbol, 0) >= max_per_stock: return
+        # 1. Freshness (CPU - Nanoseconds)
+        ts = _parse_candle_ts(candle_payload.get("ts"))
+        if (dt.now(IST) - ts).total_seconds() > 300: return
 
-        prev_high = _get_prev_day_high(redis_client, symbol)
-        if not prev_high: return
+        # 2. Global Switch (RAM - Nanoseconds)
+        if not self.cached_engine_enabled: return
 
+        # 3. Parse Data (CPU - Microseconds)
         try:
-            low = float(candle_payload.get("low") or 0)
-            high = float(candle_payload.get("high") or 0)
+            low = float(candle_payload.get("low") or 0); high = float(candle_payload.get("high") or 0)
             vol = int(candle_payload.get("volume") or 0)
-            close = float(candle_payload.get("close") or 0)
-            open_p = float(candle_payload.get("open") or 0)
-            ts = _parse_candle_ts(candle_payload.get("ts"))
+            close = float(candle_payload.get("close") or 0); open_p = float(candle_payload.get("open") or 0)
             vol_sma = float(candle_payload.get("vol_sma_375") or 0)
             vol_price_cr = float(candle_payload.get("vol_price_cr") or 0)
         except: return
-        # Check Price Floor
-        if close < 100: return # Filter out cheap stocks
 
-        # BASIC STRATEGY: Close > Open, Close > Prev High
+        # 4. Price Structure Check (CPU - Instant)
+        if close < 100: return 
         if not (close > open_p): return
+
+        # 5. Volume Math Filter (CPU - Instant)
+        if not self._check_volume_criteria(vol, vol_sma, vol_price_cr): return
+
+        # --- CANDIDATE FOUND (Passed Volume) ---
+        self._smart_log(symbol, f"CB: Candidate {symbol} | Vol:{vol} SMA:{vol_sma}")
+
+        # 6. Blacklist Check (RAM)
+        if symbol in self.cached_blacklist: return
+        
+        # 7. Duplicate Check (Redis - Fast)
+        if redis_client.sismember(self.active_entries_set, symbol): return
+
+        # 8. Redis Check: Prev Day High (Medium)
+        prev_high = _get_prev_day_high(redis_client, symbol)
+        if not prev_high: return
+        
+        # 9. Pattern Logic (CPU)
         if not (low < prev_high < close): return
         if not (open_p < prev_high): return
         
-        # --- SIZE & STOP LOGIC ---
-        candle_size_pct = 0.0
-        if close > 0:
-            candle_size_pct = (high - low) / close
-
-        # Default Stop: Candle Low
+        candle_size_pct = (high - low) / close if close > 0 else 0
         stop_base = low
 
-        # SPECIAL CASE: Large Candle (> 0.7%)
         if candle_size_pct > BREAKOUT_MAX_CANDLE_PCT:
             prev_close = _get_prev_day_close(redis_client, symbol)
-            if not prev_close: return # Cannot verify condition without prev close
-
-            # Condition 1: (CandleHigh - PrevClose) <= 3%
-            diff_high_pc_pct = (high - prev_close) / prev_close
-            if diff_high_pc_pct > 0.03: 
-                # logger.info(f"CB: {symbol} Rejected (High-PrevClose > 3%)")
-                return
-
-            # Condition 2: (CandleHigh - PrevHigh) <= 0.5%
-            diff_high_ph_pct = (high - prev_high) / prev_high
-            if diff_high_ph_pct > 0.005:
-                # logger.info(f"CB: {symbol} Rejected (High-PrevHigh > 0.5%)")
-                return
-
-            # If passed, Modify Stop Loss to Prev Day High
+            if not prev_close: return 
+            if ((high - prev_close) / prev_close) > 0.03: return
+            if ((high - prev_high) / prev_high) > 0.005: return
             stop_base = prev_high
-            logger.info(f"CB: {symbol} Special Entry Triggered (SL = Prev High)")
 
-        # Global Volume Check
-        if not self._check_volume_criteria(vol, vol_sma, vol_price_cr):
-            return
+        # 10. Database Checks (Postgres Network I/O - ~2ms)
+        close_old_connections()
+        if self._get_todays_symbol_counts().get(symbol, 0) >= int(self.cached_settings.get("trades_per_stock", 2)): return
 
-        # Register Setup
-        rr_mult = _parse_ratio_string(bull_settings.get("risk_reward", "1:2"), 2.0)
+        # 11. Execute (Create Pending Trade)
         entry = high * (1.0 + ENTRY_OFFSET_PCT)
-        stop = stop_base - (stop_base * STOP_OFFSET_PCT) # Apply offset to base
-        
-        # Placeholder target
-        target = entry + (rr_mult * (entry - stop))
+        stop = stop_base - (stop_base * STOP_OFFSET_PCT)
+        rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
+        target = entry + (rr * (entry - stop))
 
         try:
             with transaction.atomic():
@@ -447,190 +313,128 @@ class CashBreakoutClient:
                 )
                 self.pending_trades[symbol] = t
                 redis_client.sadd(self.active_entries_set, symbol)
-                logger.info(f"CB: Setup Found {symbol} (Est Target: {target:.2f})")
-        except Exception as e: logger.error(f"CB: Setup error {symbol}: {e}")
+                logger.info(f"CB: Setup Found {symbol}. Target: {target:.2f}")
+        except Exception as e: logger.error(f"CB: Setup error: {e}")
 
-
-    def _try_enter_pending(self) -> None:
-        # INTEGRATION: Check Engine Enabled - STRICTLY BLOCK ENTRY
-        if not self._is_engine_buying_enabled():
-            return 
-
-        if not self.pending_trades: return
-        live_ohlc = self._get_live_ohlc()
-        to_remove = []
+    def _try_enter_pending(self):
+        if not self.cached_engine_enabled or not self.pending_trades: return
         now = dt.now(IST)
+        to_remove = []
 
         for symbol, trade in list(self.pending_trades.items()):
-            if self._is_symbol_blacklisted(symbol):
+            # RAM Blacklist Check
+            if symbol in self.cached_blacklist:
                 trade.status = "EXPIRED"; trade.exit_reason = "Blacklisted"; trade.save()
                 redis_client.srem(self.active_entries_set, symbol)
-                to_remove.append(symbol)
-                logger.info(f"CB: {symbol} setup expired because stock was Banned.")
-                continue
-
-            lock_key = f"{self.entry_lock_key_prefix}:{symbol}"
-            if redis_client.exists(lock_key): continue
-
-            ltp = live_ohlc.get(symbol, {}).get("ltp", 0.0)
-            if ltp == 0: continue
-
-            # Time Expiry
-            if trade.candle_ts and (now > trade.candle_ts + timedelta(minutes=MAX_MONITORING_MINUTES)):
-                trade.status = "EXPIRED"; trade.save(); redis_client.srem(self.active_entries_set, symbol)
                 to_remove.append(symbol); continue
 
-            # SL Hit pre-entry
-            if ltp < trade.stop_level:
-                trade.status = "EXPIRED"; trade.save(); redis_client.srem(self.active_entries_set, symbol)
-                to_remove.append(symbol); continue
+            # RAM Price Check
+            tick_data = self.latest_prices.get(symbol)
+            if not tick_data: continue
+            
+            ltp = tick_data['ltp']
+            
+            # --- NO STALE CHECK ---
+            if ltp <= 0: continue
 
-            # Trigger
-            if ltp > trade.entry_level:
-                if not redis_client.set(lock_key, "1", nx=True, ex=5): continue
-                try:
-                    qty = self._calculate_quantity(ltp, trade.stop_level)
-                    if qty <= 0: raise ValueError("Qty 0")
-                    if not self._check_and_increment_trade_count(): raise Exception("Global Limit")
+            # Smart Logging: Show we are watching
+            self._smart_log(symbol, f"CB: Watching {symbol} | LTP:{ltp} Entry:{trade.entry_level}")
 
-                    oid = self._place_order(symbol, qty, "BUY")
-                    with transaction.atomic():
-                        trade.status = "PENDING_ENTRY"; trade.quantity = qty; trade.entry_order_id = oid; trade.save()
-                    logger.info(f"CB: BUY {symbol} Qty:{qty}")
-                except Exception as e:
-                    logger.error(f"CB: Buy failed {symbol}: {e}")
-                    redis_client.decr(self.trade_count_key) # Rollback count
-                    trade.status = "FAILED_ENTRY"; trade.save()
+            # Expiry Check (IST aware)
+            if trade.candle_ts:
+                trade_ts = trade.candle_ts if trade.candle_ts.tzinfo else IST.localize(trade.candle_ts)
+                if now > trade_ts + timedelta(minutes=MAX_MONITORING_MINUTES):
+                    logger.info(f"CB: EXPIRED {symbol} at {now.time()}")
+                    trade.status = "EXPIRED"; trade.save()
                     redis_client.srem(self.active_entries_set, symbol)
-                finally:
-                    redis_client.delete(lock_key)
-                    to_remove.append(symbol)
+                    to_remove.append(symbol); continue
+
+            if ltp < trade.stop_level:
+                trade.status = "EXPIRED"; trade.save()
+                redis_client.srem(self.active_entries_set, symbol)
+                to_remove.append(symbol); continue
+
+            if ltp > trade.entry_level:
+                # Lock to prevent double order
+                if redis_client.set(f"{self.entry_lock_key_prefix}:{symbol}", "1", nx=True, ex=5):
+                    try:
+                        qty = self._calculate_quantity(ltp, trade.stop_level)
+                        if qty <= 0: raise ValueError("Qty 0")
+                        if self._check_and_increment_trade_count():
+                            oid = self._place_order(symbol, qty, "BUY")
+                            with transaction.atomic():
+                                trade.status = "PENDING_ENTRY"; trade.quantity = qty; trade.entry_order_id = oid; trade.save()
+                            logger.info(f"CB: BUY {symbol} Qty:{qty}")
+                    except Exception as e:
+                        logger.error(f"CB: Buy Err {symbol}: {e}")
+                        redis_client.decr(self.trade_count_key)
+                        trade.status = "FAILED_ENTRY"; trade.save()
+                        redis_client.srem(self.active_entries_set, symbol)
+                    finally:
+                        redis_client.delete(f"{self.entry_lock_key_prefix}:{symbol}")
+                        to_remove.append(symbol)
 
         for s in to_remove: self.pending_trades.pop(s, None)
 
-    # ------------------- 3. MONITORING (Always Runs) -------------------
-    
-    # --- UPDATED: STEP-BASED TRAILING (LADDER LOGIC) ---
     def _check_trailing_stop(self, trade, ltp):
-        """
-        Updates Stop Loss in STEPS based on a Ratio.
-        Example: Risk 5, Ratio 1.5 -> Step Size 7.5.
-        - Moves to Cost when Profit >= 7.5.
-        - Moves to 107.5 when Profit >= 15.0.
-        """
         if trade.status != "OPEN": return
-
-        # 1. Determine Initial Risk (R)
-        # We try to calculate risk based on Entry vs Current SL. 
-        # If SL is already above Entry (trailed), we must estimate original risk 
-        # using the Target (Target = Entry + Risk*RR).
-        settings = self._get_bull_settings()
-        risk_reward_rr = _parse_ratio_string(settings.get("risk_reward", "1:2"), 2.0)
+        risk_reward_rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
         
-        # Reverse engineer risk if we are already in profit/trailed
         if trade.stop_level >= trade.entry_price:
-            # Risk = (Target - Entry) / Original_RR
-            # Safety div by zero check, though RR should default to 2.0
             div = risk_reward_rr if risk_reward_rr > 0 else 2.0
             init_risk = (trade.target_level - trade.entry_price) / div
         else:
-            # Standard calculation for initial state
             init_risk = trade.entry_price - trade.stop_level
 
         if init_risk <= 0: return
-
-        # 2. Calculate Step Size (S)
-        trail_ratio_str = settings.get("trailing_sl", "1:1.5")
-        trail_ratio_mult = _parse_ratio_string(trail_ratio_str, 1.5)
-        
-        step_size = init_risk * trail_ratio_mult
-        
-        # 3. Calculate Current Profit
+        step_size = init_risk * _parse_ratio_string(self.cached_settings.get("trailing_sl", "1:1.5"), 1.5)
         current_profit = ltp - trade.entry_price
-        
-        # 4. Determine Ladder Level
-        # Logic: If Profit is 7.5 (Step is 7.5), we are at Level 1.
-        # Level 1 means SL should be at Entry + (0 * Step) = Entry.
-        # Level 2 (Profit 15) means SL should be at Entry + (1 * Step).
-        if current_profit < step_size:
-            return # Haven't reached the first step yet
+        if current_profit < step_size: return
 
-        # How many full steps have we climbed?
         levels_gained = floor(current_profit / step_size)
-        
-        # Calculate where the SL should be for this level
-        # Formula: New SL = Entry + ((Level - 1) * Step_Size)
-        # Level 1 -> Entry + 0 = Cost
-        # Level 2 -> Entry + 7.5 = First Target
         new_sl_level = trade.entry_price + ((levels_gained - 1) * step_size)
-
-        # 5. Update SL only if it moves UP
-        # Round to nearest tick (0.05)
         new_sl_level = round(new_sl_level * 20) / 20
 
         if new_sl_level > trade.stop_level:
             old_sl = trade.stop_level
             trade.stop_level = new_sl_level
             trade.save(update_fields=['stop_level'])
-            logger.info(f"CB: STEP TRAIL {trade.symbol}. Lvl:{levels_gained} | Profit:{current_profit:.2f} | SL: {old_sl} -> {new_sl_level}")
+            logger.info(f"CB: STEP TRAIL {trade.symbol}. Lvl:{levels_gained} | SL: {old_sl} -> {new_sl_level}")
 
-    def monitor_trades(self) -> None:
-        """
-        Runs continuously to manage Stops/Targets/Exits.
-        Allows Exits even if Engine Disabled.
-        """
-        # Panic Button
+    def monitor_trades(self):
         if redis_client.exists(KEY_PANIC_TRIGGER):
             redis_client.delete(KEY_PANIC_TRIGGER)
-            logger.warning("CB: PANIC BUTTON PRESSED. Exiting all trades.")
             self.force_square_off("Panic Button")
 
         if not self.open_trades: return
-        settings = self._get_bull_settings()
-        live_ohlc = self._get_live_ohlc()
-        unrealized_pnl = 0.0
-
+        
         for symbol, trade in list(self.open_trades.items()):
-            # CHECK INDIVIDUAL EXIT REQUEST FROM FRONTEND
             if redis_client.sismember(self.force_exit_set, str(trade.id)):
-                self.exit_trade(trade, live_ohlc.get(symbol, {}).get("ltp", 0.0), "Manual Exit")
-                redis_client.srem(self.force_exit_set, str(trade.id))
-                continue
+                self.exit_trade(trade, self.latest_prices.get(symbol, {}).get('ltp', 0.0), "Manual Exit")
+                redis_client.srem(self.force_exit_set, str(trade.id)); continue
 
-            # Skip if already exiting
             if redis_client.sismember(self.exiting_trades_set, trade.id): continue
             
-            ltp = live_ohlc.get(symbol, {}).get("ltp", 0.0)
-            if ltp == 0: continue
+            tick = self.latest_prices.get(symbol)
+            if not tick or tick['ltp'] <= 0: continue
+            ltp = tick['ltp']
             
-            # Sync DB status
-            try: 
-                trade = CashBreakoutTrade.objects.get(id=trade.id)
-                if trade.status != "OPEN": 
-                    self.open_trades.pop(symbol, None); continue
-                self.open_trades[symbol] = trade
-            except: continue
+            # Log Monitor status throttled
+            self._smart_log(symbol, f"CB: Monitor {symbol} PnL:{ltp - trade.entry_price:.2f}")
 
-            # Apply Step-Based Trailing
             self._check_trailing_stop(trade, ltp)
 
-            # PnL Calc
-            unrealized_pnl += (ltp - trade.entry_price) * trade.quantity
-
-            # Exits
             if ltp <= trade.stop_level: self.exit_trade(trade, ltp, "SL Hit")
             elif ltp >= trade.target_level: self.exit_trade(trade, ltp, "Target Hit")
 
-        # Global P&L Monitor
-        if settings.get("pnl_exit_enabled", False):
+        if self.cached_settings.get("pnl_exit_enabled", False):
             try: realized = float(redis_client.get(self.daily_pnl_key) or 0)
             except: realized = 0.0
-            net = realized + unrealized_pnl
             
-            max_p = float(settings.get("max_profit", 999999))
-            max_l = float(settings.get("max_loss", 999999))
-
-            if net >= max_p or net <= -max_l:
+            unrealized = sum([(self.latest_prices.get(t.symbol, {}).get('ltp', t.entry_price) - t.entry_price) * t.quantity for t in self.open_trades.values()])
+            net = realized + unrealized
+            
+            if net >= float(self.cached_settings.get("max_profit", 999999)) or net <= -float(self.cached_settings.get("max_loss", 999999)):
                 redis_client.sadd(self.limit_reached_key, "P&L_EXIT")
                 self.force_square_off(f"P&L Exit (Net: {net:.2f})")
 
@@ -648,120 +452,86 @@ class CashBreakoutClient:
         for s, t in list(self.open_trades.items()):
             if t.status == "OPEN": self.exit_trade(t, None, reason)
 
-    # ------------------- Reconcile & Stream -------------------
-    @transaction.atomic
-    def reconcile_trades(self):
-        qs = CashBreakoutTrade.objects.select_for_update().filter(
-            account=self.account, status__in=["PENDING_ENTRY", "PENDING_EXIT"]
-        )
-        if not qs.exists(): return
-
-        for trade in qs:
-            order_id = trade.entry_order_id if trade.status == "PENDING_ENTRY" else trade.exit_order_id
-            is_entry = trade.status == "PENDING_ENTRY"
-
-            if not order_id:
-                trade.status = "FAILED_ENTRY" if is_entry else "FAILED_EXIT"; trade.save()
-                if is_entry: self._rollback_trade_count()
-                redis_client.srem(self.active_entries_set, trade.symbol)
-                continue
-
-            try:
-                time.sleep(RECONCILE_SLEEP_PER_CALL)
-                hist = self.kite.order_history(order_id)
-                last = hist[-1] if hist else {}
-                status = last.get('status')
-
-                if is_entry:
-                    if status == "COMPLETE":
-                        filled = int(last.get("filled_quantity", 0))
-                        if filled > 0:
-                            # CRITICAL: Recalculate Target based on Executed Price
-                            avg_price = float(last.get("average_price", 0.0))
-                            
-                            settings = self._get_bull_settings()
-                            risk_mult = _parse_ratio_string(settings.get("risk_reward", "1:2"), 2.0)
-                            
-                            # Real Risk (Actual Entry - SL)
-                            real_risk = avg_price - trade.stop_level
-                            # New Dynamic Target
-                            new_target = avg_price + (real_risk * risk_mult)
-                            
-                            trade.status = "OPEN"
-                            trade.entry_price = avg_price
-                            trade.quantity = filled
-                            trade.entry_time = timezone.now()
-                            trade.target_level = new_target # <--- SAVING NEW TARGET
-                            trade.save()
-                            
-                            self.open_trades[trade.symbol] = trade
-                            self.pending_trades.pop(trade.symbol, None)
-                            
-                            logger.info(f"CB: {trade.symbol} FILLED @ {avg_price:.2f}. Tgt: {new_target:.2f}")
-
-                    elif status in ("REJECTED", "CANCELLED", "FAILED"):
-                        redis_client.decr(self.trade_count_key) # Rollback count
-                        trade.status = "FAILED_ENTRY"; trade.save()
-                        self.pending_trades.pop(trade.symbol, None)
-                        redis_client.srem(self.active_entries_set, trade.symbol)
-                else: # Exit
-                    if status == "COMPLETE":
-                        trade.status = "CLOSED"
-                        trade.exit_price = float(last.get("average_price", 0.0))
-                        trade.exit_time = timezone.now()
-                        trade.pnl = (trade.exit_price - trade.entry_price) * trade.quantity
-                        trade.save()
-                        redis_client.incrbyfloat(self.daily_pnl_key, trade.pnl)
-                        self.open_trades.pop(trade.symbol, None)
-                        redis_client.srem(self.exiting_trades_set, trade.id)
-                        redis_client.srem(self.active_entries_set, trade.symbol)
-                        logger.info(f"CB: {trade.symbol} CLOSED. PnL: {trade.pnl:.2f}")
-                    elif status in ("REJECTED", "CANCELLED", "FAILED"):
-                        trade.status = "OPEN"; trade.exit_order_id = None; trade.save()
-                        redis_client.srem(self.exiting_trades_set, trade.id)
-
-            except TokenException:
-                self.running = False; break
-            except Exception as e:
-                logger.error(f"CB: Reconcile error {trade.symbol}: {e}")
-
-    def _rollback_trade_count(self):
-        try:
-            if redis_client.exists(self.trade_count_key):
-                redis_client.decr(self.trade_count_key)
-        except: pass
-
-    def _listen_to_stream(self):
+    def _reconcile_loop(self):
         while self.running:
+            close_old_connections()
             try:
-                msgs = redis_client.xreadgroup(self.group_name, self.consumer_name, {CANDLE_STREAM_KEY: '>'}, count=50, block=1000)
+                qs = CashBreakoutTrade.objects.filter(account=self.account, status__in=["PENDING_ENTRY", "PENDING_EXIT"])
+                if qs.exists():
+                    all_orders = self.kite.orders()
+                    omap = {o['order_id']: o for o in all_orders}
+                    for t in qs:
+                        oid = t.entry_order_id if t.status == "PENDING_ENTRY" else t.exit_order_id
+                        if not oid: 
+                            t.status = "FAILED_ENTRY" if t.status=="PENDING_ENTRY" else "FAILED_EXIT"; t.save()
+                            redis_client.srem(self.active_entries_set, t.symbol)
+                            continue
+                        if oid not in omap: continue
+                        
+                        d = omap[oid]; st = d['status']
+                        if st == "COMPLETE":
+                            fill = float(d['average_price'])
+                            if t.status == "PENDING_ENTRY":
+                                t.status = "OPEN"; t.entry_price = fill; t.quantity = int(d['filled_quantity'])
+                                t.entry_time = timezone.now()
+                                rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
+                                t.target_level = fill + ((fill - t.stop_level) * rr)
+                                t.save(); self.open_trades[t.symbol] = t; self.pending_trades.pop(t.symbol, None)
+                            else:
+                                t.status = "CLOSED"; t.exit_price = fill; t.exit_time = timezone.now()
+                                t.pnl = (fill - t.entry_price) * t.quantity
+                                t.save(); redis_client.incrbyfloat(self.daily_pnl_key, t.pnl)
+                                self.open_trades.pop(t.symbol, None); redis_client.srem(self.exiting_trades_set, t.id); redis_client.srem(self.active_entries_set, t.symbol)
+                        elif st in ["CANCELLED", "REJECTED"]:
+                            if t.status == "PENDING_ENTRY":
+                                t.status = "FAILED_ENTRY"; t.save(); redis_client.decr(self.trade_count_key)
+                                redis_client.srem(self.active_entries_set, t.symbol); self.pending_trades.pop(t.symbol, None)
+                            else:
+                                t.status = "OPEN"; t.exit_order_id = None; t.save(); redis_client.srem(self.exiting_trades_set, t.id)
+                time.sleep(0.5)
+            except: time.sleep(1)
+
+    def _listen_to_stream(self, stream_key, is_candle=False):
+        while self.running:
+            self._update_global_cache() # REFRESH SETTINGS
+            try:
+                msgs = redis_client.xreadgroup(self.group_name, self.consumer_name, {stream_key: '>'}, count=200, block=1000)
                 if msgs:
                     for _, messages in msgs:
                         ack_ids = []
                         for mid, fields in messages:
                             try:
-                                raw = fields.get(b'data') or fields.get('data')
-                                if raw: 
-                                    if isinstance(raw, bytes): raw = raw.decode()
-                                    payload = json.loads(raw)
-                                    now = dt.now(IST).time()
-                                    if now >= self.account.breakout_start_time and now <= self.account.breakout_end_time:
-                                        self._process_candle(payload)
+                                if is_candle:
+                                    raw = fields.get(b'data') or fields.get('data')
+                                    if raw: 
+                                        payload = json.loads(raw.decode() if isinstance(raw, bytes) else raw)
+                                        now = dt.now(IST).time()
+                                        if now >= self.account.breakout_start_time and now <= self.account.breakout_end_time:
+                                            self._process_candle(payload)
+                                else:
+                                    # Tick Update
+                                    sym = fields.get(b'symbol') or fields.get('symbol')
+                                    ltp = fields.get(b'ltp') or fields.get('ltp')
+                                    if sym and ltp:
+                                        s_str = sym.decode() if isinstance(sym, bytes) else sym
+                                        l_flt = float(ltp.decode() if isinstance(ltp, bytes) else ltp)
+                                        self.latest_prices[s_str] = {'ltp': l_flt, 'ts': dt.now(IST)}
                                 ack_ids.append(mid)
                             except: pass
-                        if ack_ids: redis_client.xack(CANDLE_STREAM_KEY, self.group_name, *ack_ids)
+                        if ack_ids: redis_client.xack(stream_key, self.group_name, *ack_ids)
+            except redis.exceptions.ResponseError:
+                self._ensure_consumer_group(stream_key, '0' if is_candle else '$'); time.sleep(1)
             except: time.sleep(1)
 
     def run(self):
         self._daily_reset_trades()
-        threading.Thread(target=self._listen_to_stream, daemon=True).start()
+        threading.Thread(target=self._listen_to_stream, args=(CANDLE_STREAM_KEY, True), daemon=True).start()
+        threading.Thread(target=self._listen_to_stream, args=(TICK_STREAM_KEY, False), daemon=True).start()
+        threading.Thread(target=self._reconcile_loop, daemon=True).start()
+        logger.info("CB: Engine Started.")
         while self.running:
-            try:
-                self._try_enter_pending() 
-                self.monitor_trades()     
-                if time.time() - self.last_reconcile_time > RECONCILE_SLEEP_PER_CALL:
-                    self.reconcile_trades(); self.last_reconcile_time = time.time()
-                time.sleep(0.1)
+            close_old_connections()
+            try: self._try_enter_pending(); self.monitor_trades(); time.sleep(0.005)
             except: time.sleep(1)
 
     def stop(self): self.running = False

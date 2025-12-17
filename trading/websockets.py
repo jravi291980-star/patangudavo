@@ -1,20 +1,726 @@
+# """
+# Refactored Websocket - STRICT FILTERING (UI + ALGO)
+# - LOGIC: ALL Data (Streams, PubSub, Snapshots) is filtered by Volume SMA.
+# - RESULT: Redis contains ONLY relevant stocks. UI shows ONLY relevant stocks.
+# - PERFORMANCE: Maximum reduction in CPU, Bandwidth, and Storage.
+# """
+
+# import json
+# import logging
+# import time
+# import math
+# import threading
+# from datetime import datetime as dt, date, time as datetime_time, timedelta
+# from typing import Optional, Any, List, Set
+
+# import pytz
+# import redis
+# from kiteconnect import KiteTicker
+# from tenacity import retry, stop_after_attempt, wait_exponential
+
+# from django.conf import settings
+# from trading.models import Account
+# from trading.utils import get_kite, get_redis_connection
+
+# logger = logging.getLogger(__name__)
+# IST = pytz.timezone('Asia/Kolkata')
+# redis_client = get_redis_connection()
+
+# # --- REDIS KEYS ---
+# CANDLE_STREAM_KEY = 'candle_1m'       # Filtered
+# TICK_STREAM_KEY = 'tick_stream'       # Filtered
+# DATA_HEARTBEAT_KEY = "algo:data:heartbeat"
+# FIXED_SMA_KEY = "algo:fixed_vol_sma"
+# FIXED_SMA_PERIOD = 1875 
+
+# KEY_BULL_SETTINGS = "algo:settings:bull"
+# KEY_BEAR_SETTINGS = "algo:settings:bear"
+# FIRST_CANDLE_PREFIX = "first_candle_915"
+
+# # --- HELPER FUNCTIONS ---
+
+# def parse_date_safe(expiry_raw) -> Optional[date]:
+#     if not expiry_raw: return None
+#     if isinstance(expiry_raw, date) and not isinstance(expiry_raw, dt): return expiry_raw
+#     if isinstance(expiry_raw, dt): return expiry_raw.date()
+#     s = str(expiry_raw).strip()
+#     fmts = ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d-%b-%Y", "%d%b%Y", "%d-%b-%y"]
+#     for f in fmts:
+#         try: return dt.strptime(s, f).date()
+#         except Exception: continue
+#     try: return dt.fromisoformat(s).date()
+#     except Exception: return None
+
+# def safe_int(x, default=None):
+#     try: return int(x)
+#     except Exception:
+#         try: return int(float(x))
+#         except Exception: return default
+
+# def _default_json_serializer(obj):
+#     try:
+#         if isinstance(obj, (date, dt)): return obj.isoformat()
+#         if isinstance(obj, float):
+#             if math.isinf(obj) or math.isnan(obj): return None
+#             return obj
+#         return str(obj)
+#     except Exception: return None
+
+# # --- PREVIOUS DAY CACHE ---
+
+# def cache_previous_day_hl(master_account=None):
+#     if not redis_client: return
+#     try:
+#         if not master_account:
+#             master_account = Account.objects.filter(is_master=True, user__is_superuser=True).first()
+#         if not master_account: return
+
+#         kite = get_kite(master_account)
+#         instrument_map_json = redis_client.get('instrument_map')
+#         if not instrument_map_json: return
+
+#         if isinstance(instrument_map_json, (bytes, bytearray)):
+#             instrument_map_json = instrument_map_json.decode('utf-8')
+
+#         instr_map = json.loads(instrument_map_json)
+#         today = dt.now(IST).date()
+#         prev_day = today - timedelta(days=1)
+#         while prev_day.weekday() >= 5: prev_day -= timedelta(days=1)
+
+#         symbols = list(settings.STOCK_INDEX_MAPPING.keys())
+#         pipe = redis_client.pipeline()
+#         stored = 0
+
+#         for symbol in symbols:
+#             token = None
+#             for t, data in instr_map.items():
+#                 if (data.get('symbol') == symbol and data.get('exchange') == 'NSE' and data.get('instrument_type') in ('EQ', 'EQUITY')):
+#                     token = safe_int(t)
+#                     break
+#             if not token: continue
+
+#             try:
+#                 hist = kite.historical_data(instrument_token=token, from_date=prev_day, to_date=prev_day, interval='day')
+#                 if not hist: continue
+#                 row = hist[-1]
+#                 high = float(row.get('high', 0.0) or 0.0)
+#                 low = float(row.get('low', 0.0) or 0.0)
+#                 close = float(row.get('close', 0.0) or 0.0)
+#                 payload = json.dumps({'date': prev_day.isoformat(), 'high': high, 'low': low, 'close': close}, default=_default_json_serializer)
+#                 pipe.hset('prev_day_ohlc', symbol, payload)
+#                 stored += 1
+#             except Exception: continue
+
+#         if stored: pipe.execute()
+#     except Exception as e: logger.error(f"PREV_HL: Overall failure: {e}")
+
+# # --- SMA CALCULATION ---
+# def cache_instruments_for_day():
+#     """Fetches NSE instruments from Kite and caches them in Redis."""
+#     logger.info("WEBSOCKET_CACHE: Starting daily unified instrument caching process (EQUITY ONLY)...")
+#     try:
+#         master_account = Account.objects.filter(is_master=True, user__is_superuser=True).first()
+#         if not master_account:
+#             logger.error("WEBSOCKET_CACHE: No master account found.")
+#             return
+
+#         kite = get_kite(master_account)
+
+#         logger.info("WEBSOCKET_CACHE: Fetching NSE instruments...")
+#         nse_instruments = kite.instruments("NSE") or []
+#         all_instruments = nse_instruments 
+
+#         symbols_to_fetch = list(settings.STOCK_INDEX_MAPPING.keys()) + list(settings.INDEX_SYMBOLS)
+#         full_instrument_symbols = [f"NSE:{s}" for s in symbols_to_fetch]
+
+#         initial_quotes = {}
+#         try:
+#             if full_instrument_symbols:
+#                 initial_quotes = kite.quote(full_instrument_symbols) or {}
+#         except Exception: pass
+
+#         instrument_map = {}
+#         circuit_limits = {}
+
+#         for inst in all_instruments:
+#             token_val = inst.get('instrument_token') or inst.get('token')
+#             if not token_val: continue
+#             token_str = str(token_val)
+
+#             symbol = (inst.get('tradingsymbol') or inst.get('symbol') or "").strip()
+#             exchange = inst.get('exchange') or inst.get('segment') or ""
+#             instrument_type = 'EQ'
+
+#             expiry = parse_date_safe(inst.get('expiry'))
+#             strike = safe_int(inst.get('strike'))
+#             name = inst.get('name', '')
+#             full_symbol = f"{exchange}:{symbol}"
+
+#             instrument_data = {
+#                 'symbol': symbol, 'exchange': exchange, 'segment': inst.get('segment', exchange),
+#                 'instrument_type': instrument_type, 'lot_size': inst.get('lot_size', 1), 'tick_size': inst.get('tick_size', 0.05),
+#                 'open': 0.0, 'high': 0.0, 'low': 0.0, 'close': 0.0, 'ltp': 0.0, 'change': 0.0, 'volume': 0,
+#                 'expiry': expiry, 'strike': strike, 'name': name,
+#             }
+#             if inst.get('instrument_type') in ('EQ', 'EQUITY'):
+#                 circuit_limits[symbol] = {
+#                     'upper': inst.get('upper_circuit_limit', float('inf')),
+#                     'lower': inst.get('lower_circuit_limit', 0)
+#                 }
+
+#             if full_symbol in initial_quotes:
+#                 quote = initial_quotes[full_symbol] or {}
+#                 ohlc = quote.get('ohlc') or {}
+#                 ltp = quote.get('last_price') or 0.0
+#                 prev_close = ohlc.get('close', 0.0)
+#                 seeded_volume = ohlc.get('volume') or quote.get('volume') or 0
+
+#                 instrument_data.update({
+#                     'close': prev_close, 'ltp': ltp,
+#                     'change': ((ltp - prev_close) / prev_close * 100) if prev_close else 0.0,
+#                     'volume': int(seeded_volume or 0), 'open': ohlc.get('open', 0.0),
+#                     'high': max(ohlc.get('high', 0.0), ltp),
+#                     'low': min(ohlc.get('low', float('inf')), ltp) if ltp > 0 else 0.0,
+#                 })
+#                 if instrument_data['low'] == 0.0 and ltp > 0: instrument_data['low'] = ltp
+
+#             instrument_map[token_str] = instrument_data
+
+#         pipe = redis_client.pipeline()
+#         pipe.set('instrument_map', json.dumps(instrument_map, default=_default_json_serializer))
+#         pipe.set('circuit_limits', json.dumps(circuit_limits, default=_default_json_serializer))
+#         pipe.execute()
+#         logger.info(f"WEBSOCKET_CACHE: Successfully cached {len(instrument_map)} total instruments.")
+#     except Exception as e:
+#         logger.error(f"WEBSOCKET_CACHE: Failed to cache instruments: {e}", exc_info=True)
+
+
+# def calculate_and_cache_fixed_volume_sma():
+#     if not redis_client: return
+    
+#     logger.info(f"SMA_CACHE: Calculating fixed SMA (Period: {FIXED_SMA_PERIOD})...")
+#     symbols = list(settings.STOCK_INDEX_MAPPING.keys())
+#     fixed_sma_map = {}
+    
+#     for symbol in symbols:
+#         key = f'candles:1m:{symbol}'
+#         try:
+#             raw_candles = redis_client.lrange(key, -FIXED_SMA_PERIOD, -1)
+#             total_vol = 0
+#             if raw_candles:
+#                 for raw in raw_candles:
+#                     try:
+#                         c_data = json.loads(raw)
+#                         total_vol += int(c_data.get('volume', 0))
+#                     except Exception: pass
+            
+#             avg_vol = int(total_vol / FIXED_SMA_PERIOD)
+#             fixed_sma_map[symbol] = avg_vol
+#         except Exception: fixed_sma_map[symbol] = 0
+
+#     if fixed_sma_map:
+#         try:
+#             redis_client.delete(FIXED_SMA_KEY)
+#             redis_client.hset(FIXED_SMA_KEY, mapping=fixed_sma_map)
+#             logger.info(f"SMA_CACHE: Cached fixed SMA for {len(fixed_sma_map)} symbols.")
+#         except Exception: pass
+        
+# # --- Cache instruments ---
+# def get_instrument_map_from_cache():
+#     if not redis_client:
+#         return {}
+#     instrument_map_json = redis_client.get('instrument_map')
+#     if instrument_map_json:
+#         try:
+#             if isinstance(instrument_map_json, (bytes, bytearray)):
+#                 instrument_map_json = instrument_map_json.decode('utf-8')
+#             return json.loads(instrument_map_json)
+#         except Exception:
+#             return {}
+#     return {}
+# # --- CANDLE AGGREGATOR ---
+
+# class CandleAggregator:
+#     def __init__(self, redis_client, filter_criteria, qualified_set_ref, whitelist_ref, max_candles=10000):
+#         self.redis = redis_client
+#         self.max_candles = max_candles
+#         self.active_candle = {}
+#         self.last_total_volume = {}
+#         self.lock = threading.Lock()
+        
+#         self.fixed_sma_map = {}
+#         self.filter_criteria = filter_criteria 
+        
+#         # References to Shared Sets
+#         self.qualified_symbols = qualified_set_ref
+#         self.whitelist_ref = whitelist_ref
+        
+#         self.load_fixed_sma()
+
+#     def load_fixed_sma(self):
+#         try:
+#             raw_map = self.redis.hgetall(FIXED_SMA_KEY)
+#             if raw_map:
+#                 self.fixed_sma_map = {
+#                     (k.decode('utf-8') if isinstance(k, bytes) else k): int(safe_int(v, 0)) 
+#                     for k, v in raw_map.items()
+#                 }
+#         except Exception: pass
+
+#     def _is_trading_minute(self, ts: dt) -> bool:
+#         t = ts.astimezone(IST).time()
+#         start = datetime_time(9, 15)
+#         end = datetime_time(15, 30)
+#         return (t >= start) and (t < end)
+
+#     def _bucket_for(self, ts: dt) -> dt:
+#         if ts.tzinfo is None: ts = pytz.utc.localize(ts)
+#         ts_ist = ts.astimezone(IST)
+#         return ts_ist.replace(second=0, microsecond=0)
+
+#     # --- THE QUALIFICATION LOGIC ---
+#     def is_qualified(self, symbol, vol, close):
+#         """
+#         Determines if a stock should be processed (UI + Algo).
+#         """
+#         # 1. Fast Path
+#         if symbol in self.qualified_symbols: return True
+#         if symbol in self.whitelist_ref: 
+#             self.qualified_symbols.add(symbol)
+#             return True
+
+#         # 2. Check Criteria
+#         if not self.filter_criteria: return True
+        
+#         sma = self.fixed_sma_map.get(symbol, 0)
+#         if close <= 0: return False
+
+#         vol_price_cr = round((vol * close) / 10000000.0, 4)
+
+#         for criteria in self.filter_criteria:
+#             try:
+#                 min_vp = criteria.get('min_vp', 0)
+#                 min_sma = criteria.get('min_sma', 0)
+#                 mult = criteria.get('mult', 0)
+                
+#                 if vol_price_cr >= min_vp:
+#                     if sma >= min_sma and vol >= (sma * mult):
+#                         self.qualified_symbols.add(symbol) # LATCH
+#                         return True
+#             except: continue
+#         return False
+
+#     def process_tick(self, symbol, ltp, ts, cumulative_volume):
+#         if not symbol or ltp is None: return
+#         try: self.redis.set(DATA_HEARTBEAT_KEY, int(time.time()), ex=10)
+#         except: pass
+
+#         if not self._is_trading_minute(ts): return
+#         bucket = self._bucket_for(ts)
+        
+#         with self.lock:
+#             active = self.active_candle.get(symbol)
+#             delta_vol = 0
+            
+#             try:
+#                 if cumulative_volume is not None:
+#                     cur_total = int(cumulative_volume)
+#                     prev_total = self.last_total_volume.get(symbol)
+#                     delta_vol = max(0, cur_total - prev_total) if prev_total is not None else 0
+#                     self.last_total_volume[symbol] = cur_total
+#                 else: delta_vol = 0
+#             except: delta_vol = 0
+
+#             if active and active['bucket'] != bucket:
+#                 self._publish_and_store(symbol, active)
+#                 self.active_candle[symbol] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': int(delta_vol)}
+#             elif not active:
+#                 self.active_candle[symbol] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': int(delta_vol)}
+#             else:
+#                 c = active
+#                 c['high'] = max(c['high'], ltp)
+#                 c['low'] = min(c['low'], ltp)
+#                 c['close'] = ltp
+#                 c['volume'] = int(c.get('volume', 0) + delta_vol)
+            
+#             # --- LIVE SNAPSHOT UPDATE (FILTERED) ---
+#             # Even the UI Live Candle is filtered now!
+#             # It will only appear in Redis if qualified.
+#             try:
+#                 cur = self.active_candle[symbol]
+#                 # Check qualification using CURRENT total volume (approx)
+#                 # Since 'cumulative_volume' is raw, we use that for filtering check
+#                 is_valid = self.is_qualified(symbol, int(cur.get('volume', 0)), ltp)
+                
+#                 if is_valid:
+#                     payload = {'ts': cur['bucket'].isoformat(), 'open': cur['open'], 'high': cur['high'], 'low': cur['low'], 'close': cur['close'], 'volume': cur['volume']}
+#                     self.redis.set(f'current_1m_candle:{symbol}', json.dumps(payload, default=_default_json_serializer))
+#             except: pass
+
+#     def _publish_and_store(self, symbol, candle):
+#         vol = int(candle.get('volume', 0))
+#         close = float(candle['close'])
+        
+#         # --- STRICT FILTERING (ALGO) ---
+#         if not self.is_qualified(symbol, vol, close):
+#             return 
+#         # -------------------------------
+
+#         vol_sma = self.fixed_sma_map.get(symbol, 0)
+#         vol_price_cr = round((vol * close) / 10000000.0, 4)
+        
+#         payload = {
+#             'symbol': symbol, 'interval': '1m', 'ts': candle['bucket'].isoformat(),
+#             'open': candle['open'], 'high': candle['high'], 'low': candle['low'], 
+#             'close': candle['close'], 'volume': vol,
+#             'vol_sma_375': vol_sma, 'vol_price_cr': vol_price_cr,
+#         }
+        
+#         try:
+#             key = f'candles:1m:{symbol}'
+#             self.redis.rpush(key, json.dumps(payload, default=_default_json_serializer))
+#             self.redis.ltrim(key, -self.max_candles, -1)
+            
+#             if candle['bucket'].time() == datetime_time(9, 15):
+#                 self.redis.set(f"{FIRST_CANDLE_PREFIX}:{symbol}", json.dumps(payload, default=_default_json_serializer), ex=86400)
+
+#             try: self.redis.xadd(CANDLE_STREAM_KEY, {'data': json.dumps(payload, default=_default_json_serializer)}, maxlen=self.max_candles, approximate=True)
+#             except TypeError: self.redis.xadd(CANDLE_STREAM_KEY, {'data': json.dumps(payload, default=_default_json_serializer)})
+
+#         except Exception as e: logger.error(f"AGG: Finalize Error {symbol}: {e}")
+
+#     def flush_all(self):
+#         with self.lock:
+#             keys = list(self.active_candle.keys())
+#             for k in keys:
+#                 c = self.active_candle.pop(k, None)
+#                 if c: self._publish_and_store(k, c)
+
+# # --- LIVE TICKER ---
+
+# class LiveTickerManager:
+#     def __init__(self, api_key, access_token, account_id):
+#         self.kws = KiteTicker(api_key, access_token)
+#         self.account_id = account_id
+#         self.redis_client = get_redis_connection()
+#         self.instrument_map = {}
+#         self.subscribed_tokens = set()
+#         self.last_publish_time = 0
+#         self.running = True
+        
+#         # --- QUALIFIED SETS ---
+#         self.qualified_symbols = set() 
+#         self.whitelist = set()
+#         self.last_whitelist_update = 0
+        
+#         self.filter_criteria = self._load_strategy_criteria()
+        
+#         self.candle_agg = CandleAggregator(self.redis_client, self.filter_criteria, self.qualified_symbols, self.whitelist, max_candles=5000)
+
+#         self.kws.on_ticks = self.on_ticks
+#         self.kws.on_connect = self.on_connect
+#         self.kws.on_close = self.on_close
+#         self.kws.on_error = self.on_error
+#         self.kws.on_order_update = self.on_order_update
+
+#     def _load_strategy_criteria(self):
+#         """Fetches Settings at Startup."""
+#         criteria = []
+#         try:
+#             bull_raw = self.redis_client.get(KEY_BULL_SETTINGS)
+#             if bull_raw:
+#                 bull = json.loads(bull_raw).get('volume_criteria', [])
+#                 for c in bull: criteria.append({'min_vp': float(c.get('min_vol_price_cr', 0)), 'min_sma': float(c.get('min_sma_avg', 0)), 'mult': float(c.get('sma_multiplier', 0))})
+            
+#             bear_raw = self.redis_client.get(KEY_BEAR_SETTINGS)
+#             if bear_raw:
+#                 bear = json.loads(bear_raw).get('volume_criteria', [])
+#                 for c in bear: criteria.append({'min_vp': float(c.get('min_vol_price_cr', 0)), 'min_sma': float(c.get('min_sma_avg', 0)), 'mult': float(c.get('sma_multiplier', 0))})
+            
+#             logger.info(f"WS_INIT: Loaded {len(criteria)} volume criteria sets.")
+#         except: pass
+#         return criteria
+
+#     def _refresh_whitelist(self):
+#         """Syncs active trade list from Redis."""
+#         if time.time() - self.last_whitelist_update < 2: return 
+#         try:
+#             keys = [
+#                 f"breakout_active_entries:{self.account_id}",
+#                 f"breakdown_active_entries:{self.account_id}",
+#                 f"mom_bull_active_entries:{self.account_id}",
+#                 f"mom_bear_active_entries:{self.account_id}"
+#             ]
+#             active_symbols = self.redis_client.sunion(keys)
+#             new_whitelist = {s.decode('utf-8') if isinstance(s, bytes) else s for s in active_symbols} if active_symbols else set()
+#             self.whitelist.clear()
+#             self.whitelist.update(new_whitelist)
+#             self.last_whitelist_update = time.time()
+#         except: pass
+
+#     def _load_instruments_from_cache(self) -> bool:
+#         try:
+#             instrument_map_json = self.redis_client.get('instrument_map')
+#             if instrument_map_json:
+#                 if isinstance(instrument_map_json, (bytes, bytearray)):
+#                     instrument_map_json = instrument_map_json.decode('utf-8')
+#                 full_map = json.loads(instrument_map_json)
+#                 self.instrument_map = {k: v for k, v in full_map.items() if v.get('exchange') == 'NSE' or v.get('symbol') in settings.INDEX_SYMBOLS}
+#                 logger.info(f"WEBSOCKET: Loaded {len(self.instrument_map)} Cash/Index instruments.")
+#                 return True
+#             return False
+#         except Exception: return False
+
+#     def on_order_update(self, ws, order):
+#         try:
+#             user_id = order.get('user_id')
+#             if not user_id: return
+#             account = Account.objects.filter(user__username=user_id).first()
+#             if not account: return
+#             channel = f"order_updates:{account.id}"
+#             message = json.dumps({
+#                 'order_id': order.get('order_id'), 'status': order.get('status'), 'status_message': order.get('status_message'),
+#                 'filled_quantity': order.get('filled_quantity', 0), 'average_price': order.get('average_price', 0.0),
+#             })
+#             self.redis_client.publish(channel, message)
+#         except Exception: pass
+
+#     def on_ticks(self, ws, ticks):
+#         self._refresh_whitelist()
+        
+#         pipe = self.redis_client.pipeline()
+#         has_stream_data = False
+
+#         for tick in ticks:
+#             token = tick.get('instrument_token') or tick.get('token')
+#             if token is None: continue
+#             token_str = str(token)
+#             if token_str not in self.instrument_map: continue
+#             instrument = self.instrument_map[token_str]
+
+#             ltp_raw = tick.get('last_price') or tick.get('ltp') or instrument.get('ltp', 0.0)
+#             try: instrument['ltp'] = float(ltp_raw)
+#             except Exception: instrument['ltp'] = float(instrument.get('ltp', 0.0) or 0.0)
+
+#             # (OHLC Updates)
+#             if 'ohlc' in tick and isinstance(tick['ohlc'], dict):
+#                 ohlc = tick['ohlc']
+#                 instrument['open'] = ohlc.get('open', instrument.get('open', 0.0))
+#                 instrument['high'] = ohlc.get('high', instrument.get('high', 0.0))
+#                 instrument['low'] = ohlc.get('low', instrument.get('low', 0.0))
+#                 instrument['close'] = ohlc.get('close', instrument.get('close', 0.0))
+#             else:
+#                 instrument['open'] = tick.get('open') or instrument.get('open', 0.0)
+#                 instrument['high'] = tick.get('high') or instrument.get('high', 0.0)
+#                 instrument['low'] = tick.get('low') or instrument.get('low', 0.0)
+#                 instrument['close'] = tick.get('close') or instrument.get('close', 0.0)
+
+#             if instrument['ltp'] > 0.0:
+#                 instrument['high'] = max(instrument.get('high', 0.0), instrument['ltp'])
+#                 cur_low = instrument.get('low', float('inf'))
+#                 if cur_low == 0.0 or cur_low == float('inf') or instrument['ltp'] < cur_low: instrument['low'] = instrument['ltp']
+
+#             raw_vol = tick.get('volume_traded') or tick.get('total_traded_quantity')
+#             if raw_vol is not None:
+#                 try: instrument['volume'] = int(raw_vol)
+#                 except Exception: pass
+
+#             prev = instrument.get('close', 0.0)
+#             if prev:
+#                 try: instrument['change'] = ((instrument['ltp'] - prev) / prev) * 100
+#                 except Exception: pass
+
+#             try:
+#                 sym = instrument.get('symbol')
+#                 if sym and sym in settings.STOCK_INDEX_MAPPING and instrument.get('exchange') == 'NSE':
+#                     ts_raw = tick.get('timestamp') or tick.get('tradable_at')
+#                     if ts_raw:
+#                         try:
+#                             if isinstance(ts_raw, dt): ts = ts_raw
+#                             else: ts = dt.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
+#                             if ts.tzinfo is None: ts = pytz.utc.localize(ts).astimezone(IST)
+#                         except Exception: ts = dt.now(IST)
+#                     else: ts = dt.now(IST)
+
+#                     cum_vol = int(raw_vol) if raw_vol is not None else None
+                    
+#                     # 1. Update Candle (Takes care of Candle Stream Filtering inside)
+#                     self.candle_agg.process_tick(sym, float(instrument['ltp'] or 0.0), ts, cum_vol)
+                    
+#                     # 2. TICK STREAM FILTER (SAFE)
+#                     # Use CandleAggregator logic to check if Qualified
+#                     is_valid = self.candle_agg.is_qualified(sym, instrument['volume'], instrument['ltp'])
+                    
+#                     if is_valid:
+#                         stream_data = {
+#                             'symbol': sym,
+#                             'ltp': str(instrument['ltp']),
+#                             'volume': str(instrument['volume']),
+#                             'ts': ts.isoformat()
+#                         }
+#                         pipe.xadd(TICK_STREAM_KEY, stream_data, maxlen=100000, approximate=True)
+#                         has_stream_data = True
+#             except Exception: pass
+
+#         if has_stream_data:
+#             pipe.execute()
+
+#         # UI Updates (Filtered)
+#         now = time.time()
+#         if now - self.last_publish_time > 0.1:
+#             self.publish_to_redis()
+#             self.last_publish_time = now
+
+#     def publish_to_redis(self):
+#         try:
+#             pipe = self.redis_client.pipeline()
+#             live_ohlc = {}
+#             stocks = []
+            
+#             for token, data in self.instrument_map.items():
+#                 sym = data.get('symbol')
+#                 if not sym or data.get('ltp', 0.0) <= 0.0: continue
+                
+#                 # --- STRICT UI FILTER ---
+#                 # Check if symbol is in the Qualified Set or Whitelist
+#                 # Index Symbols are ALWAYS allowed
+#                 is_index = sym in settings.INDEX_SYMBOLS
+#                 if not is_index and sym not in self.qualified_symbols and sym not in self.whitelist:
+#                     continue
+#                 # ------------------------
+
+#                 live_ohlc[sym] = {
+#                     'ltp': data.get('ltp', 0.0), 'open': data.get('open', 0.0), 'high': data.get('high', 0.0),
+#                     'low': data.get('low', 0.0), 'close': data.get('close', 0.0), 'change': data.get('change', 0.0),
+#                     'sector': settings.STOCK_INDEX_MAPPING.get(sym, 'N/A'), 'volume': int(data.get('volume', 0)),
+#                 }
+                
+#                 if sym in settings.STOCK_INDEX_MAPPING and data.get('exchange') == 'NSE':
+#                     stocks.append({
+#                         'symbol': sym, 'ltp': data['ltp'], 'change': data['change'],
+#                         'day_open': data['open'], 'day_high': data['high'], 'day_low': data['low'],
+#                         'sector': settings.STOCK_INDEX_MAPPING.get(sym, 'N/A'), 'volume': int(data.get('volume', 0)),
+#                     })
+
+#             if live_ohlc:
+#                 pipe.set('live_ohlc_data', json.dumps(live_ohlc, default=_default_json_serializer))
+#                 # Filter PubSub too
+#                 # Note: We reconstruct list based on `live_ohlc` keys to ensure consistency
+#                 ticks_list = [{'instrument_token': t, 'last_price': d.get('ltp',0), 'volume': int(d.get('volume',0))} 
+#                               for t, d in self.instrument_map.items() if d.get('symbol') in live_ohlc]
+#                 pipe.publish('ticks_channel', json.dumps(ticks_list))
+
+#             stocks.sort(key=lambda x: x['change'], reverse=True)
+#             indices = [v for v in self.instrument_map.values() if v.get('symbol') in settings.INDEX_SYMBOLS and v.get('ltp', 0) > 0]
+#             indices.sort(key=lambda x: x['change'], reverse=True)
+            
+#             pipe.set('top_gainers', json.dumps(stocks[:30], default=_default_json_serializer))
+#             pipe.set('top_losers', json.dumps(stocks[-30:][::-1], default=_default_json_serializer))
+#             pipe.set('top_sectors', json.dumps(indices[:10], default=_default_json_serializer))
+#             pipe.set('bottom_sectors', json.dumps(indices[-10:][::-1], default=_default_json_serializer))
+#             pipe.execute()
+#         except Exception: pass
+
+#     # ... (Keep on_connect, on_close, on_error, start/stop_connection) ...
+#     def on_connect(self, ws, response):
+#         logger.info("WEBSOCKET: Connected.")
+#         self.redis_client.set('websocket_status', 'connected')
+#         st = {safe_int(t) for t, d in self.instrument_map.items() if d.get('symbol') in settings.STOCK_INDEX_MAPPING and d.get('exchange') == 'NSE'}
+#         it = {safe_int(t) for t, d in self.instrument_map.items() if d.get('symbol') in settings.INDEX_SYMBOLS}
+#         try:
+#             target = self.redis_client.hkeys('prev_day_ohlc')
+#             if target:
+#                 decoded = {s.decode('utf-8') if isinstance(s, bytes) else str(s) for s in target}
+#                 for t, d in self.instrument_map.items():
+#                     if d.get('symbol') in decoded and d.get('exchange') == 'NSE': st.add(safe_int(t))
+#         except Exception: pass
+#         subs = list((st | it) - {None})
+#         self.subscribed_tokens = set(subs)
+#         if subs:
+#             try: ws.subscribe(subs); ws.set_mode(ws.MODE_FULL, subs); logger.info(f"WEBSOCKET: Subscribed to {len(subs)} tokens.")
+#             except Exception: pass
+
+#     def on_close(self, ws, code, reason):
+#         logger.warning(f"WEBSOCKET: Closed. Code: {code}, Reason: {reason}")
+#         self.redis_client.set('websocket_status', 'disconnected')
+
+#     def on_error(self, ws, code, reason):
+#         logger.error(f"WEBSOCKET: Error. Code: {code}, Reason: {reason}")
+
+#     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
+#     def start_connection(self):
+#         logger.info("WEBSOCKET: Starting connection...")
+#         self.kws.connect(threaded=True)
+
+#     def stop_connection(self):
+#         try:
+#             if getattr(self.kws, 'is_connected', lambda: False)() or getattr(self.kws, 'is_connecting', lambda: False)():
+#                 self.kws.close(1000, "Manual stop")
+#         except Exception: pass
+
+#     def run(self):
+#         if not self._load_instruments_from_cache():
+#             logger.warning("WEBSOCKET: Missing instrument cache. Rebuilding...")
+#             try: cache_instruments_for_day(); self._load_instruments_from_cache()
+#             except Exception: return
+        
+#         if not self.redis_client.exists('prev_day_ohlc'):
+#             try: cache_previous_day_hl()
+#             except Exception: pass
+        
+#         try: calculate_and_cache_fixed_volume_sma(); self.candle_agg.load_fixed_sma()
+#         except Exception as e: logger.error(f"WEBSOCKET: Fixed SMA Calc Failed: {e}")
+
+#         while self.running:
+#             connect_time = datetime_time(9, 10); disconnect_time = datetime_time(15, 35)
+#             now = dt.now(IST); today = now.date()
+#             if today.weekday() >= 5: time.sleep(3600); continue
+#             target = IST.localize(dt.combine(today, connect_time))
+#             if now < target:
+#                 sleep_sec = (target - now).total_seconds()
+#                 if sleep_sec > 0: time.sleep(sleep_sec)
+            
+#             if dt.now(IST).time() < disconnect_time:
+#                 if not getattr(self.kws, 'is_connected', lambda: False)():
+#                     try: self.start_connection()
+#                     except Exception: pass
+#                 while dt.now(IST).time() < disconnect_time and self.running:
+#                     if not getattr(self.kws, 'is_connected', lambda: False)():
+#                         try: self.start_connection()
+#                         except Exception: pass
+#                     time.sleep(30)
+            
+#             try: self.candle_agg.flush_all()
+#             except Exception: pass
+#             if getattr(self.kws, 'is_connected', lambda: False)(): self.stop_connection()
+#             time.sleep(60)
+
+#     def stop(self):
+#         self.running = False
+#         try: self.stop_connection()
+#         except Exception: pass
+
+# def start_websocket_thread(master_account):
+#     if not redis_client: return
+#     tm = LiveTickerManager(master_account.api_key, master_account.access_token, master_account.id)
+#     t = threading.Thread(target=tm.run, daemon=True)
+#     t.start()
+#     return tm
+
 """
-Refactored Websocket / Instrument / Candle manager for KiteConnect
-- UPDATED: Volume SMA period increased to 1875 (approx 5 days of 1-minute candles).
-- UPDATED: Adds 'algo:data:heartbeat' for Dashboard connectivity check.
-- FIXED: Volume Spike Bug on Reconnect (Initialize baseline without adding delta).
-- Integrated Dashboard Metric Calculations (Volume * Price).
+Refactored Websocket - STRICT FILTERING (ALGO ONLY)
+- LOGIC: ALL Data (Streams, PubSub, Snapshots) is filtered by Volume SMA.
+- SMA SOURCE: Externally seeded via 'seed_daily_volume' command.
+- RESULT: Redis contains ONLY relevant stocks for Algo Trading. No Dashboard fluff.
 """
 
 import json
 import logging
 import time
-import re
 import math
 import threading
 from datetime import datetime as dt, date, time as datetime_time, timedelta
-from collections import defaultdict
-from typing import Optional, Any, List
+from typing import Optional, Any, List, Set
 
 import pytz
 import redis
@@ -23,382 +729,114 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from django.conf import settings
 from trading.models import Account
-from trading.utils import get_kite, get_redis_connection, is_market_open
+from trading.utils import get_kite, get_redis_connection
 
 logger = logging.getLogger(__name__)
 IST = pytz.timezone('Asia/Kolkata')
 redis_client = get_redis_connection()
 
-# A set of F&O eligible underlying symbols - from settings or empty
-FNO_STOCKS = set(getattr(settings, 'SIMULATION_FNO_STOCKS', []))
-
-# The key used for the Redis Stream
-CANDLE_STREAM_KEY = 'candle_1m'
+# --- REDIS KEYS ---
+CANDLE_STREAM_KEY = 'candle_1m'       # Filtered
+TICK_STREAM_KEY = 'tick_stream'       # Filtered
 DATA_HEARTBEAT_KEY = "algo:data:heartbeat"
+FIXED_SMA_KEY = "algo:fixed_vol_sma"  # Populated by management command
 
-# --- REDIS KEYS FOR SETTINGS SYNC (MATCHING FRONTEND) ---
-KEY_GLOBAL_SETTINGS = "algo:settings:global"
 KEY_BULL_SETTINGS = "algo:settings:bull"
 KEY_BEAR_SETTINGS = "algo:settings:bear"
+FIRST_CANDLE_PREFIX = "first_candle_915"
 
-
-# --- Utility helpers ---
+# --- HELPER FUNCTIONS ---
 
 def parse_date_safe(expiry_raw) -> Optional[date]:
-    """Try multiple common expiry formats; return a date or None."""
-    if not expiry_raw:
-        return None
-    if isinstance(expiry_raw, date) and not isinstance(expiry_raw, dt):
-        return expiry_raw
-    if isinstance(expiry_raw, dt):
-        return expiry_raw.date()
+    if not expiry_raw: return None
+    if isinstance(expiry_raw, date) and not isinstance(expiry_raw, dt): return expiry_raw
+    if isinstance(expiry_raw, dt): return expiry_raw.date()
     s = str(expiry_raw).strip()
     fmts = ["%Y-%m-%d", "%Y-%m-%dT%H:%M:%S", "%d-%b-%Y", "%d%b%Y", "%d-%b-%y"]
     for f in fmts:
-        try:
-            return dt.strptime(s, f).date()
-        except Exception:
-            continue
-    try:
-        return dt.fromisoformat(s).date()
-    except Exception:
-        return None
-
+        try: return dt.strptime(s, f).date()
+        except Exception: continue
+    try: return dt.fromisoformat(s).date()
+    except Exception: return None
 
 def safe_int(x, default=None):
-    try:
-        return int(x)
+    try: return int(x)
     except Exception:
-        try:
-            return int(float(x))
-        except Exception:
-            return default
-
+        try: return int(float(x))
+        except Exception: return default
 
 def _default_json_serializer(obj):
     try:
-        if isinstance(obj, (date, dt)):
-            return obj.isoformat()
+        if isinstance(obj, (date, dt)): return obj.isoformat()
         if isinstance(obj, float):
-            if math.isinf(obj) or math.isnan(obj):
-                return None
+            if math.isinf(obj) or math.isnan(obj): return None
             return obj
         return str(obj)
-    except Exception:
-        return None
+    except Exception: return None
 
-
-# --- Previous day high/low caching ---
+# --- PREVIOUS DAY CACHE ---
 
 def cache_previous_day_hl(master_account=None):
-    """
-    Caches previous trading day's OHLC (high, low, date) for symbols present in
-    settings.STOCK_INDEX_MAPPING into Redis hash 'prev_day_ohlc'.
-    """
-    if not redis_client:
-        logger.error("PREV_HL: Redis unavailable. Skipping previous day high/low caching.")
-        return
-
+    if not redis_client: return
     try:
         if not master_account:
             master_account = Account.objects.filter(is_master=True, user__is_superuser=True).first()
-        if not master_account:
-            logger.error("PREV_HL: No master account found. Skipping.")
-            return
+        if not master_account: return
 
         kite = get_kite(master_account)
-
-        # Load instrument map and map symbols->token
         instrument_map_json = redis_client.get('instrument_map')
-        if not instrument_map_json:
-            logger.warning("PREV_HL: instrument_map not found in Redis. Please run cache_instruments_for_day() first.")
-            return
+        if not instrument_map_json: return
 
-        # Redis may return bytes
         if isinstance(instrument_map_json, (bytes, bytearray)):
             instrument_map_json = instrument_map_json.decode('utf-8')
 
         instr_map = json.loads(instrument_map_json)
-
         today = dt.now(IST).date()
-        # Find previous trading day
         prev_day = today - timedelta(days=1)
-        while prev_day.weekday() >= 5:  # if weekend, go back
-            prev_day -= timedelta(days=1)
+        while prev_day.weekday() >= 5: prev_day -= timedelta(days=1)
 
         symbols = list(settings.STOCK_INDEX_MAPPING.keys())
         pipe = redis_client.pipeline()
         stored = 0
 
         for symbol in symbols:
-            # find NSE EQ instrument token
             token = None
             for t, data in instr_map.items():
                 if (data.get('symbol') == symbol and data.get('exchange') == 'NSE' and data.get('instrument_type') in ('EQ', 'EQUITY')):
                     token = safe_int(t)
                     break
-            if not token:
-                continue
+            if not token: continue
 
             try:
                 hist = kite.historical_data(instrument_token=token, from_date=prev_day, to_date=prev_day, interval='day')
-                if not hist:
-                    continue
+                if not hist: continue
                 row = hist[-1]
                 high = float(row.get('high', 0.0) or 0.0)
                 low = float(row.get('low', 0.0) or 0.0)
-                payload = json.dumps({'date': prev_day.isoformat(), 'high': high, 'low': low}, default=_default_json_serializer)
+                close = float(row.get('close', 0.0) or 0.0)
+                payload = json.dumps({'date': prev_day.isoformat(), 'high': high, 'low': low, 'close': close}, default=_default_json_serializer)
                 pipe.hset('prev_day_ohlc', symbol, payload)
                 stored += 1
-            except Exception:
-                continue
+            except Exception: continue
 
-        if stored:
-            pipe.execute()
-            logger.info(f"PREV_HL: Stored previous day OHLC for {stored} symbols in Redis 'prev_day_ohlc'.")
-        else:
-            logger.warning("PREV_HL: No previous day OHLC stored.")
+        if stored: pipe.execute()
+    except Exception as e: logger.error(f"PREV_HL: Overall failure: {e}")
 
-    except Exception as e:
-        logger.error(f"PREV_HL: Overall failure: {e}", exc_info=True)
-
-
-# --- Candle Aggregator for 1-minute candles ---
-class CandleAggregator:
-    """
-    Aggregates ticks into 1-minute candles and adds them to a Redis Stream.
-    Includes Fixes for Volume Spikes and SMA Logic.
-    """
-
-    def __init__(self, redis_client, max_candles=10000):
-        self.redis = redis_client
-        self.max_candles = max_candles
-        # UPDATED: Changed from 375 to 1875 candles (~5 trading days)
-        self.sma_period = 1875  
-        
-        # active_candle[symbol] = {'bucket': datetime, 'open':..., 'high':..., 'low':..., 'close':..., 'volume':...}
-        self.active_candle = {}
-        # last_total_volume used to compute delta
-        self.last_total_volume = {}
-        self.lock = threading.Lock()
-        
-        # Temporary storage for 9:15 candles to check against 9:16 candles for strategy logic
-        self.first_candles_cache = {} 
-
-    def _is_trading_minute(self, ts: dt) -> bool:
-        # trading minutes: 09:15 <= minute < 15:30
-        t = ts.astimezone(IST).time()
-        start = datetime_time(9, 15)
-        end = datetime_time(15, 30)
-        return (t >= start) and (t < end)
-
-    def _bucket_for(self, ts: dt) -> dt:
-        # Ensure ts is timezone-aware; assume UTC if naive
-        if ts.tzinfo is None or ts.tzinfo.utcoffset(ts) is None:
-            ts = pytz.utc.localize(ts)
-        ts_ist = ts.astimezone(IST)
-        return ts_ist.replace(second=0, microsecond=0)
-
-    def process_tick(self, symbol: str, ltp: float, ts: dt, cumulative_volume: Optional[int]):
-        if not symbol or ltp is None:
-            return
-        
-        # --- HEARTBEAT FOR DASHBOARD ---
-        try:
-            # Set a key with 10s expiry to indicate data flow
-            self.redis.set(DATA_HEARTBEAT_KEY, int(time.time()), ex=10)
-        except Exception:
-            pass
-        # -------------------------------
-
-        try:
-            if not self._is_trading_minute(ts):
-                return
-        except Exception:
-            return
-
-        bucket = self._bucket_for(ts)
-        key_active = symbol
-        with self.lock:
-            active = self.active_candle.get(key_active)
-
-            # --- VOLUME DELTA CALCULATION ---
-            delta_vol = 0
-            try:
-                if cumulative_volume is not None:
-                    cur_total = int(cumulative_volume)
-                    prev_total = self.last_total_volume.get(symbol)
-                    
-                    if prev_total is None:
-                        # FIX: If this is the first time we see this symbol (e.g. restart),
-                        # assume delta is 0. Do NOT use the entire day's cumulative volume.
-                        delta_vol = 0
-                    else:
-                        delta_vol = max(0, cur_total - prev_total)
-                    
-                    # Update baseline for next tick
-                    self.last_total_volume[symbol] = cur_total
-                else:
-                    delta_vol = 0
-            except Exception:
-                delta_vol = 0
-            # --------------------------------
-
-            # if no active candle or bucket changed, finalize old candle
-            if not active or active['bucket'] != bucket:
-                if active:
-                    # finalize and persist
-                    try:
-                        self._publish_and_store(symbol, active)
-                    except Exception:
-                        logger.exception("CANDLE_AGG: Error finalizing candle during bucket rollover")
-                # start new candle
-                self.active_candle[key_active] = {
-                    'bucket': bucket,
-                    'open': ltp,
-                    'high': ltp,
-                    'low': ltp,
-                    'close': ltp,
-                    'volume': int(delta_vol or 0),
-                }
-            else:
-                # update existing
-                c = active
-                c['high'] = max(c['high'], ltp)
-                c['low'] = min(c['low'], ltp)
-                c['close'] = ltp
-                c['volume'] = int(c.get('volume', 0) + (delta_vol or 0))
-
-            # Also update current_1m_candle slot for consumers (Live Feed)
-            try:
-                cur = self.active_candle[key_active]
-                payload = {
-                    'ts': cur['bucket'].isoformat(),
-                    'open': cur['open'],
-                    'high': cur['high'],
-                    'low': cur['low'],
-                    'close': cur['close'],
-                    'volume': cur['volume'],
-                }
-                self.redis.set(f'current_1m_candle:{symbol}', json.dumps(payload, default=_default_json_serializer))
-            except Exception:
-                pass
-
-    def _calculate_sma_and_vol_stats(self, symbol: str, current_volume: int, current_close: float):
-        """
-        Calculates the Volume SMA based on the last 1875 candles stored in Redis.
-        EXCLUDES the current candle from the SMA calculation (Historical Baseline).
-        """
-        key = f'candles:1m:{symbol}'
-        sma_val = 0
-        
-        try:
-            # Fetch last N completed candles from Redis (indices are inclusive)
-            # We want the PREVIOUS 1875 candles.
-            
-            # lrange(key, -1875, -1) gets the last 1875 completed candles from history
-            prev_candles_raw = self.redis.lrange(key, -self.sma_period, -1)
-            
-            volumes = []
-            for raw in prev_candles_raw:
-                try:
-                    c_data = json.loads(raw)
-                    volumes.append(c_data.get('volume', 0))
-                except:
-                    pass
-            
-            # NOTE: We DO NOT append current_volume here.
-            
-            if volumes:
-                sma_val = sum(volumes) / len(volumes)
-            else:
-                # Fallback if no history exists (start of day/first candle without seeding)
-                sma_val = current_volume 
-                
-        except Exception as e:
-            sma_val = current_volume
-
-        # Calculate Vol * Price (in Crores)
-        vol_price_cr = 0
-        try:
-            vol_price_cr = round((current_volume * current_close) / 10000000.0, 4)
-        except:
-            pass
-
-        return sma_val, vol_price_cr
-
-    def _publish_and_store(self, symbol: str, candle: dict):
-        # 1. Calculate SMA (Historical) and Vol Price Stats BEFORE pushing current candle to history list
-        vol_sma, vol_price_cr = self._calculate_sma_and_vol_stats(symbol, int(candle.get('volume', 0)), candle['close'])
-
-        payload = {
-            'symbol': symbol,
-            'interval': '1m',
-            'ts': candle['bucket'].isoformat(),
-            'open': candle['open'],
-            'high': candle['high'],
-            'low': candle['low'],
-            'close': candle['close'],
-            'volume': int(candle.get('volume', 0)),
-            # --- New Fields for Strategy Engine & Dashboard ---
-            'vol_sma_375': vol_sma, # Kept key name for compatibility, but value is 1875 SMA
-            'vol_price_cr': vol_price_cr,
-            # ------------------------------------------------
-        }
-        
-        try:
-            key = f'candles:1m:{symbol}'
-            # store as JSON string into a list for backward compatibility
-            self.redis.rpush(key, json.dumps(payload, default=_default_json_serializer))
-            # keep only last max_candles
-            self.redis.ltrim(key, -self.max_candles, -1)
-            
-            # set latest snapshot with enriched data
-            self.redis.set(f'current_1m_candle:{symbol}', json.dumps(payload, default=_default_json_serializer))
-            
-            # Store technicals separately for easy dashboard access
-            tech_payload = {'symbol': symbol, 'vol_sma_375': vol_sma, 'vol_price_cr': vol_price_cr}
-            self.redis.set(f'technical:1m:{symbol}', json.dumps(tech_payload))
-
-            # Publish using Redis Stream (XADD).
-            try:
-                self.redis.xadd(CANDLE_STREAM_KEY, {'data': json.dumps(payload, default=_default_json_serializer)}, maxlen=self.max_candles, approximate=True)
-            except TypeError:
-                self.redis.xadd(CANDLE_STREAM_KEY, {'data': json.dumps(payload, default=_default_json_serializer)})
-
-        except Exception as e:
-            logger.error(f"CANDLE_AGG: Failed to XADD/store candle for {symbol}: {e}", exc_info=True)
-
-    def flush_all(self):
-        """Force finalize all active candles (e.g., at market close)."""
-        with self.lock:
-            keys = list(self.active_candle.keys())
-            for k in keys:
-                c = self.active_candle.pop(k, None)
-                if c:
-                    try:
-                        self._publish_and_store(k, c)
-                    except Exception:
-                        logger.exception(f"CANDLE_AGG: Error flushing candle for {k}")
-
-
-# --- Cache instruments ---
 def get_instrument_map_from_cache():
-    if not redis_client:
-        return {}
+    """Helper to retrieve the instrument map from Redis."""
+    if not redis_client: return {}
     instrument_map_json = redis_client.get('instrument_map')
     if instrument_map_json:
         try:
             if isinstance(instrument_map_json, (bytes, bytearray)):
                 instrument_map_json = instrument_map_json.decode('utf-8')
             return json.loads(instrument_map_json)
-        except Exception:
-            return {}
+        except Exception: return {}
     return {}
-
-
+# --- INSTRUMENT CACHING ---
 def cache_instruments_for_day():
-    logger.info("WEBSOCKET_CACHE: Starting daily unified instrument caching process...")
+    """Fetches NSE instruments from Kite and caches them in Redis."""
+    logger.info("WEBSOCKET_CACHE: Starting daily unified instrument caching process (EQUITY ONLY)...")
     try:
         master_account = Account.objects.filter(is_master=True, user__is_superuser=True).first()
         if not master_account:
@@ -407,10 +845,9 @@ def cache_instruments_for_day():
 
         kite = get_kite(master_account)
 
-        logger.info("WEBSOCKET_CACHE: Fetching NSE & NFO instruments...")
+        logger.info("WEBSOCKET_CACHE: Fetching NSE instruments...")
         nse_instruments = kite.instruments("NSE") or []
-        nfo_instruments = kite.instruments("NFO") or []
-        all_instruments = nse_instruments + nfo_instruments
+        all_instruments = nse_instruments 
 
         symbols_to_fetch = list(settings.STOCK_INDEX_MAPPING.keys()) + list(settings.INDEX_SYMBOLS)
         full_instrument_symbols = [f"NSE:{s}" for s in symbols_to_fetch]
@@ -419,54 +856,23 @@ def cache_instruments_for_day():
         try:
             if full_instrument_symbols:
                 initial_quotes = kite.quote(full_instrument_symbols) or {}
-        except Exception:
-            logger.warning("WEBSOCKET_CACHE: kite.quote() failed for initial symbols; data will start at zero/default.")
+        except Exception: pass
 
         instrument_map = {}
         circuit_limits = {}
 
         for inst in all_instruments:
-            token_val = inst.get('instrument_token') or inst.get('token') or inst.get('instrumentToken')
-            if not token_val:
-                continue
+            token_val = inst.get('instrument_token') or inst.get('token')
+            if not token_val: continue
             token_str = str(token_val)
 
-            symbol = (inst.get('tradingsymbol') or inst.get('symbol') or inst.get('name') or "").strip()
+            symbol = (inst.get('tradingsymbol') or inst.get('symbol') or "").strip()
             exchange = inst.get('exchange') or inst.get('segment') or ""
-            raw_it = inst.get('instrument_type') or inst.get('instrumentType') or ""
-            itype_field = str(raw_it).upper() if raw_it is not None else ""
-            sym_upper = symbol.upper()
+            instrument_type = 'EQ'
 
-            if 'OPT' in itype_field or 'OPTION' in itype_field or sym_upper.endswith('CE') or sym_upper.endswith('PE'):
-                instrument_type = 'OPT'
-            elif 'FUT' in itype_field or 'FUTURE' in itype_field:
-                instrument_type = 'FUT'
-            elif itype_field in ('EQUITY', 'EQ'):
-                instrument_type = 'EQ'
-            else:
-                seg = (inst.get('segment') or exchange or "").upper()
-                if 'NFO' in seg and (sym_upper.endswith('CE') or sym_upper.endswith('PE') or 'FUT' in sym_upper):
-                    instrument_type = 'OPT' if (sym_upper.endswith('CE') or sym_upper.endswith('PE')) else 'FUT'
-                else:
-                    instrument_type = 'EQ'
-
-            expiry = inst.get('expiry') or inst.get('expiry_date') or None
-            strike_raw = inst.get('strike') or inst.get('strike_price') or None
+            expiry = parse_date_safe(inst.get('expiry'))
+            strike = safe_int(inst.get('strike'))
             name = inst.get('name', '')
-
-            try:
-                if isinstance(expiry, dt): expiry = expiry.date()
-                if isinstance(expiry, date): expiry = expiry.isoformat()
-            except Exception:
-                pass
-
-            strike = None
-            try:
-                if strike_raw not in (None, '', 'None'):
-                    strike = float(strike_raw)
-            except Exception:
-                strike = None
-
             full_symbol = f"{exchange}:{symbol}"
 
             instrument_data = {
@@ -475,7 +881,7 @@ def cache_instruments_for_day():
                 'open': 0.0, 'high': 0.0, 'low': 0.0, 'close': 0.0, 'ltp': 0.0, 'change': 0.0, 'volume': 0,
                 'expiry': expiry, 'strike': strike, 'name': name,
             }
-            if inst.get('instrument_type') == 'EQ':
+            if inst.get('instrument_type') in ('EQ', 'EQUITY'):
                 circuit_limits[symbol] = {
                     'upper': inst.get('upper_circuit_limit', float('inf')),
                     'lower': inst.get('lower_circuit_limit', 0)
@@ -503,428 +909,250 @@ def cache_instruments_for_day():
         pipe.set('instrument_map', json.dumps(instrument_map, default=_default_json_serializer))
         pipe.set('circuit_limits', json.dumps(circuit_limits, default=_default_json_serializer))
         pipe.execute()
-
         logger.info(f"WEBSOCKET_CACHE: Successfully cached {len(instrument_map)} total instruments.")
     except Exception as e:
         logger.error(f"WEBSOCKET_CACHE: Failed to cache instruments: {e}", exc_info=True)
-        raise
 
+# --- CANDLE AGGREGATOR ---
 
-# --- FNO Manager ---
-class FnoTickerManager:
-    def __init__(self, api_key, access_token, subscription_strategy='nearest_expiry', atm_strike_count=8):
-        self.kws = KiteTicker(api_key, access_token)
-        self.redis_client = get_redis_connection()
-        self.instrument_map = {}
-        self.fno_structured_map = {}
-        self.subscribed_tokens = set()
-        self.last_publish_time = 0
-        self.running = True
-        self.subscription_strategy = subscription_strategy
-        self.atm_strike_count = int(atm_strike_count)
-        self.last_underlying_movers = set()
-        self.DYNAMIC_UPDATE_INTERVAL = 0.3
+class CandleAggregator:
+    def __init__(self, redis_client, filter_criteria, qualified_set_ref, whitelist_ref, max_candles=10000):
+        self.redis = redis_client
+        self.max_candles = max_candles
+        self.active_candle = {}
+        self.last_total_volume = {}
+        self.lock = threading.Lock()
+        
+        self.fixed_sma_map = {}
+        self.filter_criteria = filter_criteria 
+        
+        # References to Shared Sets
+        self.qualified_symbols = qualified_set_ref
+        self.whitelist_ref = whitelist_ref
+        
+        self.load_fixed_sma()
 
-        self._pubsub = None
-
-        self.kws.on_ticks = self.on_ticks
-        self.kws.on_connect = self.on_connect
-        self.kws.on_close = self.on_close
-        self.kws.on_error = self.on_error
-        self.kws.on_order_update = self.on_order_update
-
-    def on_order_update(self, ws, order):
+    def load_fixed_sma(self):
+        """Loads externally seeded SMA from Redis."""
         try:
-            user_id = order.get('user_id')
-            if not user_id: return
-            account = Account.objects.filter(user__username=user_id).first()
-            if not account: return
-            channel = f"order_updates:{account.id}"
-            message = json.dumps({
-                'order_id': order.get('order_id'), 'status': order.get('status'), 'status_message': order.get('status_message'),
-                'filled_quantity': order.get('filled_quantity', 0), 'average_price': order.get('average_price', 0.0),
-            })
-            self.redis_client.publish(channel, message)
-        except Exception as e:
-            logger.error(f"FNO_WEBSOCKET_ORDER_UPDATE: Error processing order update: {e}", exc_info=True)
+            raw_map = self.redis.hgetall(FIXED_SMA_KEY)
+            if raw_map:
+                self.fixed_sma_map = {
+                    (k.decode('utf-8') if isinstance(k, bytes) else k): int(safe_int(v, 0)) 
+                    for k, v in raw_map.items()
+                }
+                logger.info(f"AGG: Loaded {len(self.fixed_sma_map)} Fixed SMA values.")
+            else:
+                logger.warning("AGG: Fixed SMA map empty! Did you run 'seed_daily_volume'?")
+        except Exception: pass
 
-    def _load_instruments_from_cache(self) -> bool:
-        try:
-            instrument_map_json = self.redis_client.get('instrument_map')
-            if instrument_map_json:
-                if isinstance(instrument_map_json, (bytes, bytearray)):
-                    instrument_map_json = instrument_map_json.decode('utf-8')
-                full_map = json.loads(instrument_map_json)
-                filtered = {}
-                structured = defaultdict(lambda: defaultdict(list))
-                today_date = dt.now(IST).date()
+    def _is_trading_minute(self, ts: dt) -> bool:
+        t = ts.astimezone(IST).time()
+        start = datetime_time(9, 15)
+        end = datetime_time(15, 30)
+        return (t >= start) and (t < end)
 
-                for k, v in full_map.items():
-                    sym = (v.get('symbol') or '').upper()
-                    itype = (v.get('instrument_type') or '').upper()
-                    seg = (v.get('segment') or v.get('exchange') or '').upper()
+    def _bucket_for(self, ts: dt) -> dt:
+        if ts.tzinfo is None: ts = pytz.utc.localize(ts)
+        ts_ist = ts.astimezone(IST)
+        return ts_ist.replace(second=0, microsecond=0)
 
-                    if (itype in ('FUT', 'OPT')) or ('NFO' in seg) or (sym.endswith('CE') or sym.endswith('PE') or 'FUT' in sym):
-                        filtered[k] = v
+    # --- THE QUALIFICATION LOGIC ---
+    # --- THE QUALIFICATION LOGIC (OPTIMIZED) ---
+    def is_qualified(self, symbol, vol, close):
+        """
+        Determines if a stock should be processed (UI + Algo).
+        OPTIMIZATION: Checks static SMA first to fail-fast on illiquid stocks 
+        before checking turnover or current volume spikes.
+        """
+        # 1. Fast Path (Latch)
+        # If already qualified or whitelisted, return immediately.
+        if symbol in self.qualified_symbols: return True
+        if symbol in self.whitelist_ref: 
+            self.qualified_symbols.add(symbol)
+            return True
 
-                        expiry_date = parse_date_safe(v.get('expiry'))
-                        strike = None
-                        try:
-                            strike = float(v.get('strike')) if v.get('strike') not in (None, '', 'None') else None
-                        except Exception:
-                            strike = None
+        # 2. Check Criteria
+        if not self.filter_criteria: return True
+        
+        # Fast Lookup (RAM)
+        sma = self.fixed_sma_map.get(symbol, 0)
+        if close <= 0: return False
 
-                        m = re.match(r'^([A-Z]+)', sym)
-                        underlying_prefix = m.group(1) if m else ''
+        # Pre-calculate turnover only if needed (Optimization: Delayed calculation if possible)
+        # However, since 'vol' and 'close' are passed in, calculating this float is cheap enough 
+        # to do once rather than inside the loop if there are multiple criteria.
+        vol_price_cr = round((vol * close) / 10000000.0, 4)
 
-                        if not underlying_prefix or (expiry_date and expiry_date < today_date):
-                            continue
-
-                        structured[underlying_prefix][expiry_date].append({
-                            'token': safe_int(k), 'symbol': sym, 'type': itype, 'expiry': expiry_date, 'strike': strike, 'raw': v,
-                        })
-
-                self.instrument_map = filtered
-                self.fno_structured_map = structured
-                logger.info(f"FNO_WEBSOCKET: Loaded {len(self.instrument_map)} NFO instruments and structured map.")
-                return True
-            return False
-        except Exception as e:
-            logger.error(f"FNO_WEBSOCKET: Failed to load NFO instruments from Redis cache: {e}", exc_info=True)
-            return False
-
-    def _get_target_tokens_from_movers(self, target_symbols: set) -> list:
-        initial_tokens = []
-        structured = self.fno_structured_map
-
-        live_ohlc = {}
-        try:
-            live_ohlc_raw = self.redis_client.get('live_ohlc_data')
-            if live_ohlc_raw:
-                if isinstance(live_ohlc_raw, (bytes, bytearray)):
-                    live_ohlc_raw = live_ohlc_raw.decode('utf-8')
-                live_ohlc = json.loads(live_ohlc_raw)
-        except Exception:
-            pass
-
-        for target in target_symbols:
-            target_key = target.upper()
-            if target_key not in structured:
-                matches = [k for k in structured.keys() if k.startswith(target_key) or target_key.startswith(k)]
-                if matches:
-                    target_key = matches[0]
-                else:
+        for criteria in self.filter_criteria:
+            try:
+                min_sma = criteria.get('min_sma', 0)
+                
+                # OPTIMIZATION 1: Filter by Liquidity (Integer Comparison)
+                # If the stock's average daily volume is too low, skip it instantly.
+                if sma < min_sma:
                     continue
 
-            expiries = sorted([e for e in structured[target_key].keys() if e is not None])
-            chosen_expiry = expiries[0] if expiries else None
-            if chosen_expiry not in structured[target_key]:
-                chosen_expiry = next(iter(structured[target_key].keys())) if structured[target_key] else None
-
-            instruments_for_expiry = structured[target_key].get(chosen_expiry, [])
-            if not instruments_for_expiry:
-                continue
-
-            for inst in instruments_for_expiry:
-                if inst['type'] == 'FUT' and inst.get('token'):
-                    initial_tokens.append(inst['token'])
-
-            underlying_ltp = None
-            underlying_ltp_data = live_ohlc.get(target_key) or live_ohlc.get(target)
-            if isinstance(underlying_ltp_data, dict):
-                try:
-                    underlying_ltp = float(underlying_ltp_data.get('ltp') or underlying_ltp_data.get('last_price') or 0.0)
-                except Exception:
-                    underlying_ltp = None
-
-            opt_candidates = [x for x in instruments_for_expiry if (x['type'] == 'OPT' or x['symbol'].endswith('CE') or x['symbol'].endswith('PE')) and x.get('strike') is not None]
-
-            if opt_candidates:
-                max_pick = max(12, self.atm_strike_count * 2)
-                if underlying_ltp and len(opt_candidates) > 0:
-                    opt_candidates.sort(key=lambda x: abs((x['strike'] or 0.0) - underlying_ltp))
-                    selected_opts = opt_candidates[:max_pick]
-                else:
-                    selected_opts = opt_candidates[:max_pick]
-
-                for s in selected_opts:
-                    if s.get('token'):
-                        initial_tokens.append(s['token'])
-
-        seen = set()
-        result = []
-        for t in initial_tokens:
-            if t not in seen and t:
-                seen.add(t)
-                result.append(t)
-        return result
-
-    def _periodic_mover_update_thread(self):
-        logger.info(f"FNO_WEBSOCKET: Starting periodic mover update thread (interval={self.DYNAMIC_UPDATE_INTERVAL}s).")
-        while self.running:
-            time.sleep(self.DYNAMIC_UPDATE_INTERVAL)
-
-            if not getattr(self.kws, 'is_connected', lambda: False)() or not is_market_open():
-                continue
-
-            try:
-                fno_gainers_raw = self.redis_client.get('fno_gainers')
-                fno_losers_raw = self.redis_client.get('fno_losers')
-
-                gainers = []
-                if fno_gainers_raw:
-                    if isinstance(fno_gainers_raw, (bytes, bytearray)):
-                        fno_gainers_raw = fno_gainers_raw.decode('utf-8')
-                    gainers = json.loads(fno_gainers_raw)
-                    
-                losers = []
-                if fno_losers_raw:
-                    if isinstance(fno_losers_raw, (bytes, bytearray)):
-                        fno_losers_raw = fno_losers_raw.decode('utf-8')
-                    losers = json.loads(fno_losers_raw)
-
-                target_symbols = set()
-                for stock in (gainers[:10] + losers[:10]):
-                    sym = stock.get('symbol') if isinstance(stock, dict) else stock
-                    if sym:
-                        target_symbols.add(str(sym).upper())
-
-                if not target_symbols:
+                # OPTIMIZATION 2: Filter by Volume Spike (Integer Math)
+                # Is the current volume significantly higher than average?
+                mult = criteria.get('mult', 0)
+                if vol < (sma * mult):
                     continue
 
-                if target_symbols == self.last_underlying_movers:
-                    continue
-
-                new_required_tokens = set(self._get_target_tokens_from_movers(target_symbols))
-
-                tokens_to_subscribe = list(new_required_tokens - self.subscribed_tokens)
-                tokens_to_unsubscribe = list(self.subscribed_tokens - new_required_tokens)
-
-                if tokens_to_unsubscribe and getattr(self.kws, 'unsubscribe', None):
-                    try:
-                        self.kws.unsubscribe(tokens_to_unsubscribe)
-                    except Exception:
-                        pass
-
-                if tokens_to_subscribe and getattr(self.kws, 'subscribe', None):
-                    try:
-                        self.kws.subscribe(tokens_to_subscribe)
-                        if getattr(self.kws, 'set_mode', None):
-                            self.kws.set_mode(self.kws.MODE_FULL, tokens_to_subscribe)
-                    except Exception:
-                        pass
-
-                self.subscribed_tokens = new_required_tokens
-                self.last_underlying_movers = target_symbols
-
-            except Exception as e:
-                logger.error(f"FNO_WEBSOCKET: Error during periodic subscription update: {e}")
-
-    def on_ticks(self, ws, ticks):
-        for tick in ticks:
-            token = tick.get('instrument_token') or tick.get('token')
-            if token is None: continue
-            token_str = str(token)
-
-            if token_str not in self.instrument_map: continue
-
-            instrument = self.instrument_map[token_str]
-            ltp_raw = tick.get('last_price') or tick.get('ltp') or instrument.get('ltp', 0.0)
-            try: instrument['ltp'] = float(ltp_raw)
-            except Exception: instrument['ltp'] = float(instrument.get('ltp', 0.0) or 0.0)
-
-            current_ltp = instrument['ltp']
-
-            if current_ltp > 0.0:
-                if instrument.get('open', 0.0) == 0.0: instrument['open'] = current_ltp
-                instrument['high'] = max(instrument.get('high', 0.0), current_ltp)
-                current_low = instrument.get('low', float('inf'))
-                if current_low == 0.0 or current_low == float('inf') or current_ltp < current_low: instrument['low'] = current_ltp
-
-            instrument['depth'] = tick.get('depth', instrument.get('depth', {}))
-
-        now = time.time()
-        if now - self.last_publish_time > 0.1:
-            self.publish_to_redis()
-            self.last_publish_time = now
-
-    def publish_to_redis(self):
-        try:
-            live_nfo_data = {}
-            for data in self.instrument_map.values():
-                if data.get('ltp', 0.0) > 0.0:
-                    live_nfo_data[data['symbol']] = {
-                        'ltp': data.get('ltp', 0.0), 'depth': data.get('depth', {}),
-                        'open': data.get('open', 0.0), 'high': data.get('high', 0.0),
-                        'low': data.get('low', 0.0), 'close': data.get('close', 0.0),
-                    }
-            if live_nfo_data:
-                self.redis_client.set('live_nfo_ohlc_data', json.dumps(live_nfo_data, default=_default_json_serializer))
-        except Exception as e:
-            logger.error(f"FNO_WEBSOCKET: Error publishing NFO data to Redis: {e}")
-
-    def on_connect(self, ws, response):
-        logger.info("FNO_WEBSOCKET: Connection to Kite Ticker successful.")
-        self.redis_client.set('fno_websocket_status', 'connected')
-        try:
-            self._run_initial_subscription()
-        except Exception as e:
-            logger.error(f"FNO_WEBSOCKET: Initial subscription failed: {e}")
-
-    def _run_initial_subscription(self):
-        max_attempts = 5; wait_delay = 5; target_symbols = set()
-
-        for attempt in range(max_attempts):
-            try:
-                fno_gainers_raw = self.redis_client.get('fno_gainers')
-                fno_losers_raw = self.redis_client.get('fno_losers')
-
-                gainers_data = fno_gainers_raw
-                if isinstance(gainers_data, (bytes, bytearray)):
-                    gainers_data = gainers_data.decode('utf-8')
-                gainers = json.loads(gainers_data) if gainers_data else []
-
-                losers_data = fno_losers_raw
-                if isinstance(losers_data, (bytes, bytearray)):
-                    losers_data = losers_data.decode('utf-8')
-                losers = json.loads(losers_data) if losers_data else []
-
-                for stock in (gainers[:10] + losers[:10]):
-                    if isinstance(stock, dict): sym = stock.get('symbol')
-                    else: sym = stock
-                    if sym: target_symbols.add(str(sym).upper())
-
-                if target_symbols:
-                    break
-            except Exception:
-                pass
-
-            if attempt < max_attempts - 1: time.sleep(wait_delay)
-
-        if not target_symbols: return
-
-        initial_tokens = self._get_target_tokens_from_movers(target_symbols)
-        self.subscribed_tokens = set(initial_tokens)
-        self.last_underlying_movers = target_symbols
-
-        if initial_tokens:
-            try:
-                self.kws.subscribe(initial_tokens)
-                self.kws.set_mode(self.kws.MODE_FULL, initial_tokens)
-            except Exception: pass
-
-    def on_close(self, ws, code, reason):
-        logger.warning(f"FNO_WEBSOCKET: Connection closed - Code: {code}, Reason: {reason}")
-        self.redis_client.set('fno_websocket_status', 'disconnected')
-
-    def on_error(self, ws, code, reason):
-        logger.error(f"FNO_WEBSOCKET: Connection error - Code: {code}, Reason: {reason}")
-
-    @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
-    def start_connection(self):
-        logger.info("FNO_WEBSOCKET: Starting Kite Ticker connection...")
-        self.kws.connect(threaded=True)
-
-    def stop_connection(self):
-        try:
-            if getattr(self.kws, 'is_connected', lambda: False)() or getattr(self.kws, 'is_connecting', lambda: False)():
-                self.kws.close(1000, "Manual stop")
-        except Exception:
-            pass
-
-    def run(self):
-        if not self._load_instruments_from_cache():
-            return
-
-        threading.Thread(target=self._periodic_mover_update_thread, daemon=True).start()
-        threading.Thread(target=self._external_subscription_listener, daemon=True).start()
-
-        while self.running:
-            connect_time = datetime_time(9, 10); disconnect_time = datetime_time(15, 35)
-            now_dt_ist = dt.now(IST); today_ist = now_dt_ist.date()
-
-            if today_ist.weekday() >= 5:
-                time.sleep(3600); continue
-
-            target_connect_dt_ist = IST.localize(dt.combine(today_ist, connect_time))
-            if now_dt_ist < target_connect_dt_ist:
-                sleep_seconds = (target_connect_dt_ist - now_dt_ist).total_seconds()
-                if sleep_seconds > 0: time.sleep(sleep_seconds)
-
-            if dt.now(IST).time() < disconnect_time:
-                if not getattr(self.kws, 'is_connected', lambda: False)():
-                    try: self.start_connection()
-                    except Exception: pass
-
-                while dt.now(IST).time() < disconnect_time and self.running:
-                    if not getattr(self.kws, 'is_connected', lambda: False)():
-                        try: self.start_connection()
-                        except Exception: pass
-                    time.sleep(10)
-
-            if getattr(self.kws, 'is_connected', lambda: False)():
-                self.stop_connection()
-
-            time.sleep(60)
-
-    def _external_subscription_listener(self):
-        try:
-            self._pubsub = self.redis_client.pubsub()
-            self._pubsub.subscribe('subscribe_tokens')
+                # OPTIMIZATION 3: Filter by Turnover (Float Comparison)
+                # Only check value if liquidity and spike conditions are met.
+                min_vp = criteria.get('min_vp', 0)
+                if vol_price_cr >= min_vp:
+                    self.qualified_symbols.add(symbol) # LATCH
+                    return True
+            except: continue
             
-            for message in self._pubsub.listen():
-                if not self.running: break
-                if message['type'] == 'message':
-                    try:
-                        raw_data = message['data']
-                        if isinstance(raw_data, (bytes, bytearray)):
-                            new_tokens = json.loads(raw_data.decode('utf-8'))
-                        else:
-                            new_tokens = json.loads(raw_data)
-                        
-                        new_tokens_to_add = [safe_int(t) for t in new_tokens if safe_int(t) and safe_int(t) not in self.subscribed_tokens]
-                        
-                        if new_tokens_to_add and getattr(self.kws, 'is_connected', lambda: False)():
-                            self.kws.subscribe(new_tokens_to_add)
-                            self.kws.set_mode(self.kws.MODE_FULL, new_tokens_to_add)
-                            self.subscribed_tokens.update(new_tokens_to_add)
-                    except Exception: pass
-        except Exception: pass
-        finally:
+        return False
+
+    def process_tick(self, symbol, ltp, ts, cumulative_volume):
+        if not symbol or ltp is None: return
+        try: self.redis.set(DATA_HEARTBEAT_KEY, int(time.time()), ex=10)
+        except: pass
+
+        if not self._is_trading_minute(ts): return
+        bucket = self._bucket_for(ts)
+        
+        with self.lock:
+            active = self.active_candle.get(symbol)
+            delta_vol = 0
+            
             try:
-                if self._pubsub: self._pubsub.close()
-            except Exception: pass
+                if cumulative_volume is not None:
+                    cur_total = int(cumulative_volume)
+                    prev_total = self.last_total_volume.get(symbol)
+                    delta_vol = max(0, cur_total - prev_total) if prev_total is not None else 0
+                    self.last_total_volume[symbol] = cur_total
+                else: delta_vol = 0
+            except: delta_vol = 0
 
-    def stop(self):
-        self.running = False
+            if active and active['bucket'] != bucket:
+                self._publish_and_store(symbol, active)
+                self.active_candle[symbol] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': int(delta_vol)}
+            elif not active:
+                self.active_candle[symbol] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': int(delta_vol)}
+            else:
+                c = active
+                c['high'] = max(c['high'], ltp)
+                c['low'] = min(c['low'], ltp)
+                c['close'] = ltp
+                c['volume'] = int(c.get('volume', 0) + delta_vol)
+            
+            # --- LIVE SNAPSHOT UPDATE (FILTERED) ---
+            try:
+                cur = self.active_candle[symbol]
+                # Check qualification using CURRENT total volume (approx)
+                is_valid = self.is_qualified(symbol, int(cur.get('volume', 0)), ltp)
+                
+                if is_valid:
+                    payload = {'ts': cur['bucket'].isoformat(), 'open': cur['open'], 'high': cur['high'], 'low': cur['low'], 'close': cur['close'], 'volume': cur['volume']}
+                    self.redis.set(f'current_1m_candle:{symbol}', json.dumps(payload, default=_default_json_serializer))
+            except: pass
+
+    def _publish_and_store(self, symbol, candle):
+        vol = int(candle.get('volume', 0))
+        close = float(candle['close'])
+        
+        # --- STRICT FILTERING (ALGO) ---
+        if not self.is_qualified(symbol, vol, close):
+            return 
+        # -------------------------------
+
+        vol_sma = self.fixed_sma_map.get(symbol, 0)
+        vol_price_cr = round((vol * close) / 10000000.0, 4)
+        
+        payload = {
+            'symbol': symbol, 'interval': '1m', 'ts': candle['bucket'].isoformat(),
+            'open': candle['open'], 'high': candle['high'], 'low': candle['low'], 
+            'close': candle['close'], 'volume': vol,
+            'vol_sma_375': vol_sma, 'vol_price_cr': vol_price_cr,
+        }
+        
         try:
-            if self._pubsub: self._pubsub.close()
-        except Exception: pass
-        try:
-            self.stop_connection()
-        except Exception: pass
+            key = f'candles:1m:{symbol}'
+            self.redis.rpush(key, json.dumps(payload, default=_default_json_serializer))
+            self.redis.ltrim(key, -self.max_candles, -1)
+            
+            if candle['bucket'].time() == datetime_time(9, 15):
+                self.redis.set(f"{FIRST_CANDLE_PREFIX}:{symbol}", json.dumps(payload, default=_default_json_serializer), ex=86400)
 
+            try: self.redis.xadd(CANDLE_STREAM_KEY, {'data': json.dumps(payload, default=_default_json_serializer)}, maxlen=self.max_candles, approximate=True)
+            except TypeError: self.redis.xadd(CANDLE_STREAM_KEY, {'data': json.dumps(payload, default=_default_json_serializer)})
 
-# --- Live Ticker Manager (Cash/Index) ---
+        except Exception as e: logger.error(f"AGG: Finalize Error {symbol}: {e}")
+
+    def flush_all(self):
+        with self.lock:
+            keys = list(self.active_candle.keys())
+            for k in keys:
+                c = self.active_candle.pop(k, None)
+                if c: self._publish_and_store(k, c)
+
+# --- LIVE TICKER ---
+
 class LiveTickerManager:
-    """WebSocket manager for Cash and Index instruments."""
-
-    def __init__(self, api_key, access_token):
+    def __init__(self, api_key, access_token, account_id):
         self.kws = KiteTicker(api_key, access_token)
+        self.account_id = account_id
         self.redis_client = get_redis_connection()
         self.instrument_map = {}
         self.subscribed_tokens = set()
         self.last_publish_time = 0
         self.running = True
-
-        # Candle aggregator instance
-        self.candle_agg = CandleAggregator(self.redis_client, max_candles=5000)
+        
+        # --- QUALIFIED SETS ---
+        self.qualified_symbols = set() 
+        self.whitelist = set()
+        self.last_whitelist_update = 0
+        
+        self.filter_criteria = self._load_strategy_criteria()
+        
+        self.candle_agg = CandleAggregator(self.redis_client, self.filter_criteria, self.qualified_symbols, self.whitelist, max_candles=5000)
 
         self.kws.on_ticks = self.on_ticks
         self.kws.on_connect = self.on_connect
         self.kws.on_close = self.on_close
         self.kws.on_error = self.on_error
         self.kws.on_order_update = self.on_order_update
+
+    def _load_strategy_criteria(self):
+        """Fetches Settings at Startup."""
+        criteria = []
+        try:
+            bull_raw = self.redis_client.get(KEY_BULL_SETTINGS)
+            if bull_raw:
+                bull = json.loads(bull_raw).get('volume_criteria', [])
+                for c in bull: criteria.append({'min_vp': float(c.get('min_vol_price_cr', 0)), 'min_sma': float(c.get('min_sma_avg', 0)), 'mult': float(c.get('sma_multiplier', 0))})
+            
+            bear_raw = self.redis_client.get(KEY_BEAR_SETTINGS)
+            if bear_raw:
+                bear = json.loads(bear_raw).get('volume_criteria', [])
+                for c in bear: criteria.append({'min_vp': float(c.get('min_vol_price_cr', 0)), 'min_sma': float(c.get('min_sma_avg', 0)), 'mult': float(c.get('sma_multiplier', 0))})
+            
+            logger.info(f"WS_INIT: Loaded {len(criteria)} volume criteria sets.")
+        except: pass
+        return criteria
+
+    def _refresh_whitelist(self):
+        """Syncs active trade list from Redis."""
+        if time.time() - self.last_whitelist_update < 2: return 
+        try:
+            keys = [
+                f"breakout_active_entries:{self.account_id}",
+                f"breakdown_active_entries:{self.account_id}",
+                f"mom_bull_active_entries:{self.account_id}",
+                f"mom_bear_active_entries:{self.account_id}"
+            ]
+            active_symbols = self.redis_client.sunion(keys)
+            new_whitelist = {s.decode('utf-8') if isinstance(s, bytes) else s for s in active_symbols} if active_symbols else set()
+            self.whitelist.clear()
+            self.whitelist.update(new_whitelist)
+            self.last_whitelist_update = time.time()
+        except: pass
 
     def _load_instruments_from_cache(self) -> bool:
         try:
@@ -934,13 +1162,10 @@ class LiveTickerManager:
                     instrument_map_json = instrument_map_json.decode('utf-8')
                 full_map = json.loads(instrument_map_json)
                 self.instrument_map = {k: v for k, v in full_map.items() if v.get('exchange') == 'NSE' or v.get('symbol') in settings.INDEX_SYMBOLS}
-                logger.info(f"WEBSOCKET: Loaded {len(self.instrument_map)} Cash/Index instruments from cache.")
+                logger.info(f"WEBSOCKET: Loaded {len(self.instrument_map)} Cash/Index instruments.")
                 return True
-            else:
-                return False
-        except Exception as e:
-            logger.error(f"WEBSOCKET: Failed to load instruments from Redis cache: {e}")
             return False
+        except Exception: return False
 
     def on_order_update(self, ws, order):
         try:
@@ -954,22 +1179,26 @@ class LiveTickerManager:
                 'filled_quantity': order.get('filled_quantity', 0), 'average_price': order.get('average_price', 0.0),
             })
             self.redis_client.publish(channel, message)
-        except Exception:
-            pass
+        except Exception: pass
 
     def on_ticks(self, ws, ticks):
+        self._refresh_whitelist()
+        
+        pipe = self.redis_client.pipeline()
+        has_stream_data = False
+
         for tick in ticks:
             token = tick.get('instrument_token') or tick.get('token')
             if token is None: continue
             token_str = str(token)
-
             if token_str not in self.instrument_map: continue
-
             instrument = self.instrument_map[token_str]
+
             ltp_raw = tick.get('last_price') or tick.get('ltp') or instrument.get('ltp', 0.0)
             try: instrument['ltp'] = float(ltp_raw)
             except Exception: instrument['ltp'] = float(instrument.get('ltp', 0.0) or 0.0)
 
+            # (OHLC Updates)
             if 'ohlc' in tick and isinstance(tick['ohlc'], dict):
                 ohlc = tick['ohlc']
                 instrument['open'] = ohlc.get('open', instrument.get('open', 0.0))
@@ -982,47 +1211,57 @@ class LiveTickerManager:
                 instrument['low'] = tick.get('low') or instrument.get('low', 0.0)
                 instrument['close'] = tick.get('close') or instrument.get('close', 0.0)
 
-            current_ltp = instrument['ltp']
-            if current_ltp > 0.0:
-                instrument['high'] = max(instrument.get('high', 0.0), current_ltp)
-                current_low = instrument.get('low', float('inf'))
-                if current_low == 0.0 or current_low == float('inf') or current_ltp < current_low: instrument['low'] = current_ltp
+            if instrument['ltp'] > 0.0:
+                instrument['high'] = max(instrument.get('high', 0.0), instrument['ltp'])
+                cur_low = instrument.get('low', float('inf'))
+                if cur_low == 0.0 or cur_low == float('inf') or instrument['ltp'] < cur_low: instrument['low'] = instrument['ltp']
 
-            raw_vol = tick.get('volume_traded') or tick.get('total_traded_quantity') or None
+            raw_vol = tick.get('volume_traded') or tick.get('total_traded_quantity')
             if raw_vol is not None:
                 try: instrument['volume'] = int(raw_vol)
-                except Exception: instrument['volume'] = int(instrument.get('volume', 0) or 0)
-            else: instrument['volume'] = int(instrument.get('volume', 0) or 0)
+                except Exception: pass
 
-            prev_close = instrument.get('close', 0.0)
-            if prev_close:
-                try: instrument['change'] = ((instrument['ltp'] - prev_close) / prev_close) * 100
-                except Exception: instrument['change'] = instrument.get('change', 0.0)
+            prev = instrument.get('close', 0.0)
+            if prev:
+                try: instrument['change'] = ((instrument['ltp'] - prev) / prev) * 100
+                except Exception: pass
 
-            # --- Feed the candle aggregator for configured stock list only ---
             try:
                 sym = instrument.get('symbol')
                 if sym and sym in settings.STOCK_INDEX_MAPPING and instrument.get('exchange') == 'NSE':
-                    ts_raw = tick.get('timestamp') or tick.get('tradable_at') or None
+                    ts_raw = tick.get('timestamp') or tick.get('tradable_at')
                     if ts_raw:
                         try:
-                            # Parse Kite ticker timestamp which is often UTC
-                            if isinstance(ts_raw, dt):
-                                ts = ts_raw
-                            else:
-                                ts = dt.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
-                            
+                            if isinstance(ts_raw, dt): ts = ts_raw
+                            else: ts = dt.fromisoformat(str(ts_raw).replace('Z', '+00:00'))
                             if ts.tzinfo is None: ts = pytz.utc.localize(ts).astimezone(IST)
-                        except Exception:
-                            ts = dt.now(IST)
-                    else:
-                        ts = dt.now(IST)
+                        except Exception: ts = dt.now(IST)
+                    else: ts = dt.now(IST)
 
                     cum_vol = int(raw_vol) if raw_vol is not None else None
+                    
+                    # 1. Update Candle (Takes care of Candle Stream Filtering inside)
                     self.candle_agg.process_tick(sym, float(instrument['ltp'] or 0.0), ts, cum_vol)
-            except Exception:
-                pass
+                    
+                    # 2. TICK STREAM FILTER (SAFE)
+                    # Use CandleAggregator logic to check if Qualified
+                    is_valid = self.candle_agg.is_qualified(sym, instrument['volume'], instrument['ltp'])
+                    
+                    if is_valid:
+                        stream_data = {
+                            'symbol': sym,
+                            'ltp': str(instrument['ltp']),
+                            'volume': str(instrument['volume']),
+                            'ts': ts.isoformat()
+                        }
+                        pipe.xadd(TICK_STREAM_KEY, stream_data, maxlen=100000, approximate=True)
+                        has_stream_data = True
+            except Exception: pass
 
+        if has_stream_data:
+            pipe.execute()
+
+        # UI Updates (Filtered)
         now = time.time()
         if now - self.last_publish_time > 0.1:
             self.publish_to_redis()
@@ -1031,160 +1270,108 @@ class LiveTickerManager:
     def publish_to_redis(self):
         try:
             pipe = self.redis_client.pipeline()
-            live_ohlc_for_engine = {}
-            stocks_to_publish = []
-
+            live_ohlc = {}
+            
             for token, data in self.instrument_map.items():
-                if data.get('ltp', 0.0) <= 0.0 or data.get('open', 0.0) <= 0.0: continue
+                sym = data.get('symbol')
+                if not sym or data.get('ltp', 0.0) <= 0.0: continue
+                
+                # --- STRICT UI FILTER ---
+                # Check if symbol is in the Qualified Set or Whitelist
+                # Index Symbols are ALWAYS allowed
+                is_index = sym in settings.INDEX_SYMBOLS
+                if not is_index and sym not in self.qualified_symbols and sym not in self.whitelist:
+                    continue
+                # ------------------------
 
-                live_ohlc_for_engine[data['symbol']] = {
+                live_ohlc[sym] = {
                     'ltp': data.get('ltp', 0.0), 'open': data.get('open', 0.0), 'high': data.get('high', 0.0),
                     'low': data.get('low', 0.0), 'close': data.get('close', 0.0), 'change': data.get('change', 0.0),
-                    'sector': settings.STOCK_INDEX_MAPPING.get(data['symbol'], 'N/A'), 'volume': int(data.get('volume', 0)),
+                    'sector': settings.STOCK_INDEX_MAPPING.get(sym, 'N/A'), 'volume': int(data.get('volume', 0)),
                 }
-
-                if data['symbol'] in settings.STOCK_INDEX_MAPPING and data.get('exchange') == 'NSE':
-                    stocks_to_publish.append({
-                        'symbol': data['symbol'], 'ltp': data['ltp'], 'change': data['change'],
-                        'day_open': data['open'], 'day_high': data['high'], 'day_low': data['low'],
-                        'sector': settings.STOCK_INDEX_MAPPING.get(data['symbol'], 'N/A'), 'volume': int(data.get('volume', 0)),
-                    })
-
-            if live_ohlc_for_engine:
-                pipe.set('live_ohlc_data', json.dumps(live_ohlc_for_engine, default=_default_json_serializer))
-                pipe.publish('ticks_channel', json.dumps([
-                    {'instrument_token': token, 'last_price': data.get('ltp', 0), 'volume': int(data.get('volume', 0))}
-                    for token, data in self.instrument_map.items() if data.get('ltp', 0) > 0 and data.get('exchange') == 'NSE'
-                ]))
-
-            fno_candidates = [s for s in stocks_to_publish if s['symbol'] in FNO_STOCKS]
-            fno_candidates.sort(key=lambda x: x['change'], reverse=True)
-
-            fno_gainers = fno_candidates[:20]; fno_losers = fno_candidates[-20:][::-1]
-
-            pipe.set('fno_gainers', json.dumps(fno_gainers, default=_default_json_serializer))
-            pipe.set('fno_losers', json.dumps(fno_losers, default=_default_json_serializer))
-
-            stocks_to_publish.sort(key=lambda x: x['change'], reverse=True)
-            indices = [inst for inst in self.instrument_map.values() if inst.get('symbol') in settings.INDEX_SYMBOLS and inst.get('ltp', 0.0) > 0.0]
-            indices.sort(key=lambda x: x['change'], reverse=True)
-
-            pipe.set('top_gainers', json.dumps(stocks_to_publish[:30], default=_default_json_serializer))
-            pipe.set('top_losers', json.dumps(stocks_to_publish[-30:][::-1], default=_default_json_serializer))
-            pipe.set('top_sectors', json.dumps(indices[:10], default=_default_json_serializer))
-            pipe.set('bottom_sectors', json.dumps(indices[-10:][::-1], default=_default_json_serializer))
+                
+            if live_ohlc:
+                pipe.set('live_ohlc_data', json.dumps(live_ohlc, default=_default_json_serializer))
+                # Filter PubSub too
+                ticks_list = [{'instrument_token': t, 'last_price': d.get('ltp',0), 'volume': int(d.get('volume',0))} 
+                              for t, d in self.instrument_map.items() if d.get('symbol') in live_ohlc]
+                pipe.publish('ticks_channel', json.dumps(ticks_list))
 
             pipe.execute()
+        except Exception: pass
 
-        except Exception:
-            pass
-
+    # ... (Keep on_connect, on_close, on_error, start/stop_connection) ...
     def on_connect(self, ws, response):
-        logger.info("WEBSOCKET: Connection to Kite Ticker successful.")
+        logger.info("WEBSOCKET: Connected.")
         self.redis_client.set('websocket_status', 'connected')
-
-        stock_tokens = [safe_int(token) for token, data in self.instrument_map.items() if data.get('symbol') in settings.STOCK_INDEX_MAPPING and data.get('exchange') == 'NSE']
-        index_tokens = [safe_int(token) for token, data in self.instrument_map.items() if data.get('symbol') in settings.INDEX_SYMBOLS]
-
-        # Ensure all stocks in prev_day_ohlc are subscribed
-        additional_symbols_to_subscribe = set()
+        st = {safe_int(t) for t, d in self.instrument_map.items() if d.get('symbol') in settings.STOCK_INDEX_MAPPING and d.get('exchange') == 'NSE'}
+        it = {safe_int(t) for t, d in self.instrument_map.items() if d.get('symbol') in settings.INDEX_SYMBOLS}
         try:
-            target_symbols = self.redis_client.hkeys('prev_day_ohlc')
-            if target_symbols:
-                decoded = set()
-                for s in target_symbols:
-                    try:
-                        if isinstance(s, (bytes, bytearray)):
-                            decoded.add(s.decode('utf-8'))
-                        else:
-                            decoded.add(str(s))
-                    except Exception:
-                        continue
-                target_symbols = decoded
-
-                for token, data in self.instrument_map.items():
-                    if data.get('symbol') in target_symbols and data.get('exchange') == 'NSE':
-                        additional_symbols_to_subscribe.add(safe_int(token))
-        except Exception:
-            pass
-
-        tokens_to_subscribe = list({t for t in (stock_tokens + index_tokens + list(additional_symbols_to_subscribe)) if t})
-        self.subscribed_tokens = set(tokens_to_subscribe)
-
-        if tokens_to_subscribe:
-            try:
-                ws.subscribe(tokens_to_subscribe)
-                ws.set_mode(ws.MODE_FULL, tokens_to_subscribe)
-                logger.info(f"WEBSOCKET: Subscribed to {len(tokens_to_subscribe)} Cash/Index tokens.")
-            except Exception:
-                pass
+            target = self.redis_client.hkeys('prev_day_ohlc')
+            if target:
+                decoded = {s.decode('utf-8') if isinstance(s, bytes) else str(s) for s in target}
+                for t, d in self.instrument_map.items():
+                    if d.get('symbol') in decoded and d.get('exchange') == 'NSE': st.add(safe_int(t))
+        except Exception: pass
+        subs = list((st | it) - {None})
+        self.subscribed_tokens = set(subs)
+        if subs:
+            try: ws.subscribe(subs); ws.set_mode(ws.MODE_FULL, subs); logger.info(f"WEBSOCKET: Subscribed to {len(subs)} tokens.")
+            except Exception: pass
 
     def on_close(self, ws, code, reason):
-        logger.warning(f"WEBSOCKET: Connection closed - Code: {code}, Reason: {reason}")
+        logger.warning(f"WEBSOCKET: Closed. Code: {code}, Reason: {reason}")
         self.redis_client.set('websocket_status', 'disconnected')
 
     def on_error(self, ws, code, reason):
-        logger.error(f"WEBSOCKET: Connection error - Code: {code}, Reason: {reason}")
+        logger.error(f"WEBSOCKET: Error. Code: {code}, Reason: {reason}")
 
     @retry(stop=stop_after_attempt(5), wait=wait_exponential(multiplier=1, min=2, max=10))
     def start_connection(self):
-        logger.info("WEBSOCKET: Starting Kite Ticker connection...")
+        logger.info("WEBSOCKET: Starting connection...")
         self.kws.connect(threaded=True)
 
     def stop_connection(self):
-        logger.info("WEBSOCKET: Stopping Kite Ticker connection...")
         try:
             if getattr(self.kws, 'is_connected', lambda: False)() or getattr(self.kws, 'is_connecting', lambda: False)():
                 self.kws.close(1000, "Manual stop")
-        except Exception:
-            pass
+        except Exception: pass
 
     def run(self):
         if not self._load_instruments_from_cache():
-            logger.warning("WEBSOCKET: Instrument map not found. Attempting to build it now...")
-            try:
-                cache_instruments_for_day()
-                if not self._load_instruments_from_cache():
-                    logger.critical("WEBSOCKET: CRITICAL FAILURE. Could not build instrument cache.")
-                    return
-            except Exception as e:
-                logger.critical(f"WEBSOCKET: CRITICAL FAILURE during cache rebuild: {e}.")
-                return
-
-        try:
-            cache_previous_day_hl()
-        except Exception:
-            pass
+            logger.warning("WEBSOCKET: Missing instrument cache. Rebuilding...")
+            try: cache_instruments_for_day(); self._load_instruments_from_cache()
+            except Exception: return
+        
+        if not self.redis_client.exists('prev_day_ohlc'):
+            try: cache_previous_day_hl()
+            except Exception: pass
+        
+        # --- NO CALCULATION, JUST LOAD ---
+        self.candle_agg.load_fixed_sma()
 
         while self.running:
             connect_time = datetime_time(9, 10); disconnect_time = datetime_time(15, 35)
-            now_dt_ist = dt.now(IST); today_ist = now_dt_ist.date()
-
-            if today_ist.weekday() >= 5:
-                time.sleep(3600); continue
-
-            target_connect_dt_ist = IST.localize(dt.combine(today_ist, connect_time))
-            if now_dt_ist < target_connect_dt_ist:
-                sleep_seconds = (target_connect_dt_ist - now_dt_ist).total_seconds()
-                if sleep_seconds > 0: time.sleep(sleep_seconds)
-
+            now = dt.now(IST); today = now.date()
+            if today.weekday() >= 5: time.sleep(3600); continue
+            target = IST.localize(dt.combine(today, connect_time))
+            if now < target:
+                sleep_sec = (target - now).total_seconds()
+                if sleep_sec > 0: time.sleep(sleep_sec)
+            
             if dt.now(IST).time() < disconnect_time:
                 if not getattr(self.kws, 'is_connected', lambda: False)():
                     try: self.start_connection()
                     except Exception: pass
-
                 while dt.now(IST).time() < disconnect_time and self.running:
                     if not getattr(self.kws, 'is_connected', lambda: False)():
                         try: self.start_connection()
                         except Exception: pass
                     time.sleep(30)
-
+            
             try: self.candle_agg.flush_all()
             except Exception: pass
-
-            if getattr(self.kws, 'is_connected', lambda: False)():
-                self.stop_connection()
-
+            if getattr(self.kws, 'is_connected', lambda: False)(): self.stop_connection()
             time.sleep(60)
 
     def stop(self):
@@ -1192,22 +1379,9 @@ class LiveTickerManager:
         try: self.stop_connection()
         except Exception: pass
 
-
-# --- Thread start helpers ---
-
 def start_websocket_thread(master_account):
-    if not redis_client: logger.error("WEBSOCKET: Cannot start, Redis client is not available."); return
-    ticker_manager = LiveTickerManager(master_account.api_key, master_account.access_token)
-    thread = threading.Thread(target=ticker_manager.run, daemon=True)
-    thread.start()
-    logger.info("WEBSOCKET: LiveTickerManager (Cash/Index) thread has been started.")
-    return ticker_manager
-
-
-def start_fno_websocket_thread(master_account, subscription_strategy='nearest_expiry', atm_strike_count=8):
-    if not redis_client: logger.error("FNO_WEBSOCKET: Cannot start, Redis client is not available."); return
-    fno_ticker_manager = FnoTickerManager(master_account.api_key, master_account.access_token, subscription_strategy=subscription_strategy, atm_strike_count=atm_strike_count)
-    thread = threading.Thread(target=fno_ticker_manager.run, daemon=True)
-    thread.start()
-    logger.info("FNO_WEBSOCKET: FnoTickerManager (NFO/Options) thread has been started.")
-    return fno_ticker_manager
+    if not redis_client: return
+    tm = LiveTickerManager(master_account.api_key, master_account.access_token, master_account.id)
+    t = threading.Thread(target=tm.run, daemon=True)
+    t.start()
+    return tm
