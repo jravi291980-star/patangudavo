@@ -543,6 +543,7 @@
 
 #     def stop(self): self.running = False
 
+
 """
 CashBreakdown Client (Short Sell Engine) - Final Production Version
 - ARCHITECTURE: Multi-Process, Redis Streams, In-Memory Caching.
@@ -564,6 +565,7 @@ import pytz
 import redis
 from django.db import transaction, models, close_old_connections
 from django.conf import settings
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_not_exception_type
 from kiteconnect.exceptions import TokenException
 
 from trading.models import Account, CashBreakdownTrade
@@ -619,10 +621,7 @@ def _parse_candle_ts(ts_str):
 
 def _parse_ratio_string(ratio_str, default):
     """Parses '1:2' to 2.0."""
-    try:
-        if isinstance(ratio_str, (int, float)): return float(ratio_str)
-        if ':' in str(ratio_str): return float(ratio_str.split(':')[1])
-        return float(ratio_str)
+    try: return float(ratio_str.split(':')[1])
     except: return default
 
 # --- MAIN ENGINE CLASS ---
@@ -640,9 +639,9 @@ class CashBreakdownClient:
         self.latest_prices = {}
 
         self.group_name = f"CBD_GROUP:{self.account.id}"
-        self.consumer_name = f"CBD_CON_{self.account.id}_{int(time.time())}" 
+        self.consumer_name = f"CBD_CONSUMER:{threading.get_ident()}" 
         
-        # --- RAM CACHE ---
+        # --- RAM CACHE (Zero Latency) ---
         self.cached_settings = {}
         self.cached_blacklist = set()
         self.cached_engine_enabled = True
@@ -659,12 +658,13 @@ class CashBreakdownClient:
         self.exiting_trades_set = f"breakdown_exiting_trades:{self.account.id}"
         self.force_exit_set = f"breakdown_force_exit_requests:{self.account.id}"
         self.entry_lock_key_prefix = f"cbd_entry_lock:{self.account.id}"
+        self.entry_setup_lock_prefix = f"cbd_entry_setup_lock:{self.account.id}"
+
         self.daily_pnl_key = f"cbd_daily_realized_pnl:{self.account.id}:{today_iso}"
 
-        if not redis_client: 
-            self.running = False
-            return
+        if not redis_client: self.running = False; return
 
+        # Ensure Groups Exist
         self._ensure_consumer_group(CANDLE_STREAM_KEY, '0')
         self._ensure_consumer_group(TICK_STREAM_KEY, '$')
 
@@ -673,14 +673,16 @@ class CashBreakdownClient:
         self._update_global_cache(force=True)
 
     def _ensure_consumer_group(self, stream_key, start_id='$'):
+        """Creates the consumer group if it does not exist (Idempotent)."""
         try:
             redis_client.xgroup_create(stream_key, self.group_name, id=start_id, mkstream=True)
-            logger.info(f"CBD: Verified group {self.group_name} for {stream_key}")
+            logger.info(f"CBD: Verified consumer group {self.group_name} for {stream_key}")
         except redis.exceptions.ResponseError as e:
-            if "BUSYGROUP" not in str(e): logger.error(f"CBD: Group Err {stream_key}: {e}")
+            if "BUSYGROUP" not in str(e): logger.error(f"CBD: Failed group {stream_key}: {e}")
         except Exception: pass
 
     def _prefill_prices(self):
+        """Loads snapshot to avoid 0 prices at startup."""
         try:
             raw = redis_client.get(LIVE_OHLC_KEY)
             if raw:
@@ -688,9 +690,11 @@ class CashBreakdownClient:
                 now = dt.now(IST)
                 for sym, info in data.items():
                     self.latest_prices[sym] = {'ltp': float(info.get('ltp', 0)), 'ts': now}
+            logger.info(f"CBD: Prefilled prices for {len(self.latest_prices)} symbols.")
         except: pass
 
     def _update_global_cache(self, force=False):
+        """Fetches Settings, Blacklist, and Status every 5 seconds (Low I/O)."""
         if force or (time.time() - self.last_cache_update > 5):
             try:
                 data = redis_client.get(KEY_BEAR_SETTINGS)
@@ -706,8 +710,9 @@ class CashBreakdownClient:
             except: pass
 
     def _smart_log(self, symbol, message):
+        """Logs a message only if 5 seconds have passed since the last log for this symbol."""
         now = time.time()
-        if now - self.log_throttle.get(symbol, 0) > 10:
+        if now - self.log_throttle.get(symbol, 0) > 5:
             logger.info(message)
             self.log_throttle[symbol] = now
 
@@ -716,28 +721,21 @@ class CashBreakdownClient:
         if now_ist.time() >= self.DAILY_RESET_TIME:
             reset_flag = f"cbd_reset:{now_ist.date()}"
             if redis_client.set(reset_flag, "1", nx=True, ex=86400):
-                self.open_trades.clear()
-                self.pending_trades.clear()
+                self.open_trades.clear(); self.pending_trades.clear()
                 redis_client.delete(self.trade_count_key, self.limit_reached_key, self.active_entries_set, self.exiting_trades_set, self.daily_pnl_key)
 
     def _load_trades_from_db(self) -> None:
         try:
             close_old_connections()
             today_start = IST.localize(dt.combine(dt.now(IST).date(), dt_time.min))
-            qs = CashBreakdownTrade.objects.filter(
-                account=self.account, 
-                created_at__gte=today_start, 
-                status__in=['OPEN', 'PENDING', 'PENDING_ENTRY', 'PENDING_EXIT']
-            )
-            self.open_trades.clear()
-            self.pending_trades.clear()
+            qs = CashBreakdownTrade.objects.filter(account=self.account, created_at__gte=today_start, status__in=['OPEN', 'PENDING', 'PENDING_ENTRY', 'PENDING_EXIT'])
+            self.open_trades.clear(); self.pending_trades.clear()
             active_syms = []
             for t in qs:
                 active_syms.append(t.symbol)
                 if t.status == 'PENDING': self.pending_trades[t.symbol] = t
                 elif t.status in ['OPEN', 'PENDING_EXIT']: self.open_trades[t.symbol] = t
-            if active_syms: 
-                redis_client.sadd(self.active_entries_set, *active_syms)
+            if active_syms: redis_client.sadd(self.active_entries_set, *active_syms)
         except: pass
 
     def _get_todays_symbol_counts(self):
@@ -746,8 +744,8 @@ class CashBreakdownClient:
         return {x['symbol']: x['count'] for x in qs.values('symbol').annotate(count=models.Count('symbol'))}
 
     def _check_and_increment_trade_count(self):
-        settings_map = self.cached_settings
-        max_trades = int(settings_map.get("total_trades", 5))
+        settings = self.cached_settings
+        max_trades = int(settings.get("total_trades", 5))
         lua = "local c=tonumber(redis.call('GET',KEYS[1]) or 0); if c>=tonumber(ARGV[1]) then return 0 end; redis.call('INCR',KEYS[1]); redis.call('EXPIRE',KEYS[1],86400); return 1"
         try: return bool(redis_client.eval(lua, 1, self.trade_count_key, max_trades))
         except: return False
@@ -755,26 +753,19 @@ class CashBreakdownClient:
     def _calculate_quantity(self, entry_price, sl_price):
         try:
             cnt = int(redis_client.get(self.trade_count_key) or 0)
-            settings_map = self.cached_settings
-            max_loss = float(settings_map.get(f"risk_trade_{min(cnt+1,3)}") or settings_map.get("risk_per_trade") or 1000)
+            settings = self.cached_settings
+            max_loss = float(settings.get(f"risk_trade_{min(cnt+1,3)}") or settings.get("risk_per_trade") or 1000)
         except: max_loss = 1000.0
 
         risk = abs(sl_price - entry_price)
         if risk <= 0: return 0
-        return max(1, int(floor(max_loss / risk)))
+        return max(0, int(floor(max_loss / risk)))
 
     def _place_order(self, symbol, qty, txn_type):
-        return self.kite.place_order(
-            tradingsymbol=symbol, 
-            quantity=qty, 
-            transaction_type=txn_type, 
-            product=self.kite.PRODUCT_MIS, 
-            order_type=self.kite.ORDER_TYPE_MARKET, 
-            exchange=self.kite.EXCHANGE_NSE, 
-            variety=self.kite.VARIETY_REGULAR
-        )
+        return self.kite.place_order(tradingsymbol=symbol, quantity=qty, transaction_type=txn_type, product=self.kite.PRODUCT_MIS, order_type=self.kite.ORDER_TYPE_MARKET, exchange=self.kite.EXCHANGE_NSE, variety=self.kite.VARIETY_REGULAR)
 
     def _check_volume_criteria(self, vol, vol_sma, vol_price_cr):
+        # Uses RAM Cached Settings (Instant)
         criteria = self.cached_settings.get("volume_criteria", [])
         if not criteria: return False
         for c in criteria:
@@ -788,7 +779,6 @@ class CashBreakdownClient:
     def _process_candle(self, payload):
         symbol = payload.get("symbol")
         if not symbol: return
-        
         ts = _parse_candle_ts(payload.get("ts"))
         if (dt.now(IST) - ts).total_seconds() > 300: return
         if not self.cached_engine_enabled: return
@@ -800,48 +790,69 @@ class CashBreakdownClient:
             vol_sma = float(payload.get("vol_sma_375", 0))
             vol_price_cr = float(payload.get("vol_price_cr", 0))
         except: return
-        
-        if close < 100: return 
+
+        if close < 100: return
         if not (close < open_p): return
         if not self._check_volume_criteria(vol, vol_sma, vol_price_cr): return
-
+        self._smart_log(symbol, f"CBD: Candidate {symbol} | Vol:{vol} SMA:{vol_sma}")
         if symbol in self.cached_blacklist: return
+
+        # fast (but possibly stale) duplicate check
         if redis_client.sismember(self.active_entries_set, symbol): return
 
         prev_low = _get_prev_day_low(redis_client, symbol)
         if not prev_low: return
-
-        # Breakdown Pattern
         if not (open_p > prev_low > close and low < prev_low): return
-        
+
         stop_base = high
         if ((high - low)/close) > BREAKDOWN_MAX_CANDLE_PCT:
             prev_close = _get_prev_day_close(redis_client, symbol)
             if not prev_close: return
-            # Gap Down Protection
             if ((low - prev_close)/prev_close < -0.03) or ((low - prev_low)/prev_low < -0.005): return
             stop_base = prev_low
 
-        close_old_connections()
-        if self._get_todays_symbol_counts().get(symbol, 0) >= int(self.cached_settings.get("trades_per_stock", 2)): return
-
-        entry = low * (1.0 - ENTRY_OFFSET_PCT)
-        stop = stop_base + (stop_base * STOP_OFFSET_PCT)
-        rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
-        target = entry - (rr * (stop - entry))
+        # --- NEW: setup-level lock to avoid duplicated PENDING creation ---
+        setup_lock = f"{self.entry_setup_lock_prefix}:{symbol}"
+        if not redis_client.set(setup_lock, "1", nx=True, ex=30):
+            return
 
         try:
+            close_old_connections()
             with transaction.atomic():
+                # re-check DB under lock
+                exists = CashBreakdownTrade.objects.select_for_update().filter(
+                    account=self.account,
+                    symbol=symbol,
+                    status__in=["PENDING","PENDING_ENTRY","OPEN","PENDING_EXIT"]
+                ).exists()
+                if exists:
+                    return
+
+                # count-per-symbol check (inside tx)
+                if self._get_todays_symbol_counts().get(symbol, 0) >= int(self.cached_settings.get("trades_per_stock", 2)):
+                    return
+
+                entry = low * (1.0 - ENTRY_OFFSET_PCT)
+                stop = stop_base + (stop_base * STOP_OFFSET_PCT)
+                rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
+                target = entry - (rr * (stop - entry))
+
                 t = CashBreakdownTrade.objects.create(
                     user=self.account.user, account=self.account, symbol=symbol,
                     candle_ts=ts, candle_open=open_p, candle_high=high, candle_low=low, candle_close=close, candle_volume=vol,
                     prev_day_low=prev_low, entry_level=entry, stop_level=stop, target_level=target,
                     volume_price=vol_price_cr, status="PENDING"
                 )
+                # update in-memory and Redis marker
                 self.pending_trades[symbol] = t
-                redis_client.sadd(self.active_entries_set, symbol)
-                logger.info(f"CBD: Signal {symbol}. Entry:{entry:.2f} SL:{stop:.2f} Tgt:{target:.2f}")
-        except Exception as e: logger.error(f"CBD: Entry Save Err: {e}")
+                try: redis_client.sadd(self.active_entries_set, symbol)
+                except: pass
+                logger.info(f"CBD: Setup Found {symbol}. Target:{target:.2f}")
+        except Exception as e:
+            logger.error(f"CBD: Setup Err: {e}")
+        finally:
+            try: redis_client.delete(setup_lock)
+            except: pass
 
     def _try_enter_pending(self):
         if not self.cached_engine_enabled or not self.pending_trades: return
@@ -849,187 +860,358 @@ class CashBreakdownClient:
         to_remove = []
 
         for symbol, trade in list(self.pending_trades.items()):
+            # RAM Blacklist Check
             if symbol in self.cached_blacklist:
                 trade.status = "EXPIRED"; trade.exit_reason = "Blacklisted"; trade.save()
-                redis_client.srem(self.active_entries_set, symbol)
+                try: redis_client.srem(self.active_entries_set, symbol)
+                except: pass
                 to_remove.append(symbol); continue
 
             tick_data = self.latest_prices.get(symbol)
             if not tick_data: continue
-            
+
             ltp = tick_data['ltp']
             if ltp <= 0: continue
 
             self._smart_log(symbol, f"CBD: Watching {symbol} | LTP:{ltp} Entry:{trade.entry_level}")
 
-            # Monitoring Expiry
-            trade_ts = trade.candle_ts if trade.candle_ts.tzinfo else IST.localize(trade.candle_ts)
-            if now > trade_ts + timedelta(minutes=MAX_MONITORING_MINUTES):
-                trade.status = "EXPIRED"; trade.save()
-                redis_client.srem(self.active_entries_set, symbol)
-                to_remove.append(symbol); continue
+            if trade.candle_ts:
+                trade_ts = trade.candle_ts if trade.candle_ts.tzinfo else IST.localize(trade.candle_ts)
+                if now > trade_ts + timedelta(minutes=MAX_MONITORING_MINUTES):
+                    logger.info(f"CBD: EXPIRED {symbol} at {now.time()}")
+                    trade.status = "EXPIRED"; trade.save()
+                    try: redis_client.srem(self.active_entries_set, symbol)
+                    except: pass
+                    to_remove.append(symbol); continue
 
-            # Stop Level Violation (Before Entry)
             if ltp > trade.stop_level:
-                trade.status = "EXPIRED"; trade.exit_reason = "SL Violated Pre-Entry"; trade.save()
-                redis_client.srem(self.active_entries_set, symbol)
+                trade.status = "EXPIRED"; trade.save()
+                try: redis_client.srem(self.active_entries_set, symbol)
+                except: pass
                 to_remove.append(symbol); continue
 
-            # Entry Trigger
             if ltp < trade.entry_level:
-                lock_key = f"{self.entry_lock_key_prefix}:{symbol}"
-                if redis_client.set(lock_key, "1", nx=True, ex=10):
-                    try:
-                        qty = self._calculate_quantity(trade.entry_level, trade.stop_level)
-                        if qty > 0 and self._check_and_increment_trade_count():
+                exec_lock = f"{self.entry_lock_key_prefix}:{symbol}"
+                if not redis_client.set(exec_lock, "1", nx=True, ex=10):
+                    continue
+                try:
+                    close_old_connections()
+                    with transaction.atomic():
+                        t = CashBreakdownTrade.objects.select_for_update().get(id=trade.id)
+                        if t.status != "PENDING":
+                            to_remove.append(symbol); continue
+
+                        qty = self._calculate_quantity(ltp, t.stop_level)
+                        if qty <= 0:
+                            t.status = "FAILED_ENTRY"; t.save()
+                            try: redis_client.srem(self.active_entries_set, symbol)
+                            except: pass
+                            to_remove.append(symbol); continue
+
+                        if not self._check_and_increment_trade_count():
+                            t.status = "EXPIRED"; t.save()
+                            try: redis_client.srem(self.active_entries_set, symbol)
+                            except: pass
+                            to_remove.append(symbol); continue
+
+                        # Place market SELL (short entry)
+                        oid = None
+                        try:
                             oid = self._place_order(symbol, qty, "SELL")
-                            with transaction.atomic():
-                                trade.status = "PENDING_ENTRY"
-                                trade.quantity = qty
-                                trade.entry_order_id = oid
-                                trade.save()
-                            logger.info(f"CBD: SELL ORDER {symbol} Qty:{qty} OID:{oid}")
-                    except Exception as e:
-                        logger.error(f"CBD: Entry Exec Err {symbol}: {e}")
-                        redis_client.decr(self.trade_count_key)
+                        except Exception as e:
+                            logger.error(f"CBD: Entry Err PlaceOrder {symbol}: {e}")
+                            try: redis_client.decr(self.trade_count_key)
+                            except: pass
+                            t.status = "FAILED_ENTRY"; t.save()
+                            try: redis_client.srem(self.active_entries_set, symbol)
+                            except: pass
+                            to_remove.append(symbol); continue
+
+                        t.status = "PENDING_ENTRY"; t.quantity = qty; t.entry_order_id = str(oid); t.save()
+                        logger.info(f"CBD: SELL {symbol} Qty:{qty} OID:{oid}")
+                except Exception as e:
+                    logger.error(f"CBD: Entry Err {symbol}: {e}")
+                    try: redis_client.decr(self.trade_count_key)
+                    except: pass
+                    try:
                         trade.status = "FAILED_ENTRY"; trade.save()
                         redis_client.srem(self.active_entries_set, symbol)
-                    finally:
-                        to_remove.append(symbol)
+                    except: pass
+                finally:
+                    try: redis_client.delete(exec_lock)
+                    except: pass
+                    to_remove.append(symbol)
 
         for s in to_remove: self.pending_trades.pop(s, None)
 
+    def _check_trailing_stop(self, trade, ltp):
+        if trade.status != "OPEN": return
+        risk_reward_rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
+
+        if trade.stop_level <= trade.entry_price:
+            div = risk_reward_rr if risk_reward_rr > 0 else 2.0
+            init_risk = (trade.entry_price - trade.target_level) / div
+        else:
+            init_risk = trade.stop_level - trade.entry_price
+
+        if init_risk <= 0: return
+
+        trail_ratio_str = self.cached_settings.get("trailing_sl", "1:1.5")
+        trail_ratio_mult = _parse_ratio_string(trail_ratio_str, 1.5)
+        step_size = init_risk * trail_ratio_mult
+        current_profit = trade.entry_price - ltp
+
+        if current_profit < step_size: return
+
+        levels_gained = floor(current_profit / step_size)
+        new_sl_level = trade.entry_price - ((levels_gained - 1) * step_size)
+        new_sl_level = round(new_sl_level * 20) / 20
+
+        if new_sl_level < trade.stop_level:
+            old_sl = trade.stop_level
+            trade.stop_level = new_sl_level
+            trade.save(update_fields=['stop_level'])
+            logger.info(f"CBD: STEP TRAIL {trade.symbol}. Lvl:{levels_gained} | Profit:{current_profit:.2f} | SL: {old_sl} -> {new_sl_level}")
+
     def monitor_trades(self):
-        """Logic for Exiting and Trailing."""
         if redis_client.exists(KEY_PANIC_TRIGGER):
-            logger.warning("PANIC TRIGGER ACTIVE!")
-            self._force_exit("Panic Squareoff")
             redis_client.delete(KEY_PANIC_TRIGGER)
-            return
+            self.force_square_off("Panic Button")
 
         if not self.open_trades: return
-        
         trail_ratio = _parse_ratio_string(self.cached_settings.get("trailing_sl", "1:1.5"), 1.5)
         
         for symbol, trade in list(self.open_trades.items()):
-            # FIX: Convert trade.id to string for Redis set consistency
-            tid_str = str(trade.id)
+            if redis_client.sismember(self.force_exit_set, str(trade.id)):
+                self.exit_trade(trade, self.latest_prices.get(symbol, {}).get('ltp', 0.0), "Manual Exit")
+                redis_client.srem(self.force_exit_set, str(trade.id)); continue
 
-            if redis_client.sismember(self.force_exit_set, tid_str):
-                self._exit_trade(trade, "Manual Exit")
-                redis_client.srem(self.force_exit_set, tid_str)
-                continue
-
-            if redis_client.sismember(self.exiting_trades_set, tid_str):
-                continue
+            if redis_client.sismember(self.exiting_trades_set, trade.id): continue
             
             tick = self.latest_prices.get(symbol)
-            if not tick or tick['ltp'] <= 0:
-                self._smart_log(symbol, f"CBD: Waiting for tick to monitor {symbol}")
-                continue
-            
+            if not tick or tick['ltp'] <= 0: continue
             ltp = tick['ltp']
-            self._smart_log(symbol, f"CBD: Open {symbol} | LTP:{ltp} SL:{trade.stop_level} Pnl:{(trade.entry_price - ltp)*trade.quantity:.2f}")
 
-            # 1. Trailing SL Logic (Bear)
-            current_profit = trade.entry_price - ltp
-            initial_risk = trade.stop_level - trade.entry_price
-            
-            if initial_risk > 0:
-                step_size = initial_risk * trail_ratio
-                if current_profit >= step_size:
-                    levels = floor(current_profit / step_size)
-                    # New SL = Entry + Risk - (levels * step)
-                    new_sl = trade.entry_price + initial_risk - (levels * step_size)
-                    new_sl = round(new_sl * 20) / 20 # 0.05 precision
-                    
-                    if new_sl < trade.stop_level:
-                        logger.info(f"CBD: Trailing {symbol} SL: {trade.stop_level} -> {new_sl}")
-                        trade.stop_level = new_sl
-                        trade.save(update_fields=['stop_level'])
+            self._smart_log(symbol, f"CBD: Monitor {symbol} PnL:{trade.entry_price - ltp:.2f}")
 
-            # 2. Hard Exit Condition
+            profit = trade.entry_price - ltp
+            risk = (trade.entry_price - trade.target_level) / 2.0 
+            if risk > 0 and profit >= (risk * trail_ratio):
+                lvl = floor(profit / (risk * trail_ratio))
+                new_sl = trade.entry_price - ((lvl-1) * (risk * trail_ratio))
+                if new_sl < trade.stop_level:
+                    trade.stop_level = new_sl; trade.save()
+
             if ltp >= trade.stop_level:
-                self._exit_trade(trade, "SL Hit")
+                self.exit_trade(trade, "SL Hit")
             elif ltp <= trade.target_level:
-                self._exit_trade(trade, "Target Hit")
+                self.exit_trade(trade, "Target Hit")
 
-    def _exit_trade(self, trade, reason):
-        tid_str = str(trade.id)
-        if redis_client.sadd(self.exiting_trades_set, tid_str):
-            try:
-                oid = self._place_order(trade.symbol, trade.quantity, "BUY")
-                with transaction.atomic():
-                    trade.status = "PENDING_EXIT"
-                    trade.exit_reason = reason
-                    trade.exit_order_id = oid
-                    trade.save()
-                logger.info(f"CBD: EXIT {trade.symbol} | {reason} | OID:{oid}")
-            except Exception as e:
-                logger.error(f"CBD: Exit Order Failed {trade.symbol}: {e}")
-                redis_client.srem(self.exiting_trades_set, tid_str)
+    def exit_trade(self, trade, reason):
+        # Acquire per-trade exit lock
+        exit_lock = f"cbd_exit_lock:{trade.id}"
+        if not redis_client.set(exit_lock, "1", nx=True, ex=15):
+            return
+        try:
+            close_old_connections()
+            with transaction.atomic():
+                t = CashBreakdownTrade.objects.select_for_update().get(id=trade.id)
+                if t.status != "OPEN":
+                    return
+
+                # place buy order to cover short
+                try:
+                    oid = self._place_order(t.symbol, t.quantity, "BUY")
+                except Exception as e:
+                    logger.error(f"CBD: Exit failed place_order {t.symbol}: {e}")
+                    return
+
+                t.status = "PENDING_EXIT"
+                t.exit_reason = reason
+                t.exit_order_id = str(oid)
+                t.save()
+
+                # update RAM + Redis immediately
+                try: self.open_trades.pop(t.symbol, None)
+                except: pass
+                try: redis_client.sadd(self.exiting_trades_set, str(t.id))
+                except: pass
+                try: redis_client.srem(self.active_entries_set, t.symbol)
+                except: pass
+        except Exception as e:
+            logger.error(f"CBD: Exit failed {trade.symbol}: {e}")
+        finally:
+            try: redis_client.delete(exit_lock)
+            except: pass
 
     def _force_exit(self, reason):
-        for s, t in list(self.open_trades.items()): 
-            self._exit_trade(t, reason)
+        for s, t in list(self.open_trades.items()): self._exit_trade(t, reason)
 
     def _reconcile_loop(self):
+        """
+        Reconciles PENDING_ENTRY and PENDING_EXIT trades with Kite.
+        This is the ONLY place where trades become OPEN or CLOSED.
+        """
+
+        logger.info("CBD: Reconciliation loop started")
+
         while self.running:
             close_old_connections()
+
             try:
-                qs = CashBreakdownTrade.objects.filter(account=self.account, status__in=["PENDING_ENTRY", "PENDING_EXIT"])
+                # Step 1: Fetch only unresolved trades
+                qs = CashBreakdownTrade.objects.filter(
+                    account=self.account,
+                    status__in=["PENDING_ENTRY", "PENDING_EXIT"]
+                )
+
                 if not qs.exists():
-                    time.sleep(1); continue
+                    time.sleep(0.5)
+                    continue
 
-                all_orders = self.kite.orders()
-                omap = {str(o['order_id']): o for o in all_orders}
+                # Step 2: Fetch Kite orders once (VERY IMPORTANT)
+                try:
+                    kite_orders = self.kite.orders()
+                    order_map = {o["order_id"]: o for o in kite_orders}
+                except Exception as e:
+                    logger.error(f"CBD RECONCILE: Kite orders fetch failed: {e}")
+                    time.sleep(1)
+                    continue
 
-                for t in qs:
-                    oid = str(t.entry_order_id if t.status == "PENDING_ENTRY" else t.exit_order_id)
-                    if not oid or oid not in omap: continue
-                    
-                    ord_data = omap[oid]
-                    if ord_data['status'] == "COMPLETE":
-                        fill = float(ord_data['average_price'])
-                        with transaction.atomic():
-                            if t.status == "PENDING_ENTRY":
-                                t.status = "OPEN"; t.entry_price = fill; t.quantity = int(ord_data['filled_quantity'])
+                # Step 3: Process each trade independently
+                for trade in qs:
+                    try:
+                        order_id = (
+                            trade.entry_order_id
+                            if trade.status == "PENDING_ENTRY"
+                            else trade.exit_order_id
+                        )
+
+                        if not order_id or order_id not in order_map:
+                            continue
+
+                        order = order_map[order_id]
+                        order_status = order.get("status")
+
+                        # ---------- ENTRY COMPLETE ----------
+                        if trade.status == "PENDING_ENTRY" and order_status == "COMPLETE":
+                            with transaction.atomic():
+                                t = (
+                                    CashBreakdownTrade.objects
+                                    .select_for_update()
+                                    .get(id=trade.id)
+                                )
+
+                                if t.status != "PENDING_ENTRY":
+                                    continue
+
+                                fill_price = float(order["average_price"])
+                                qty = int(order["filled_quantity"])
+
+                                t.entry_price = fill_price
+                                t.quantity = qty
                                 t.entry_time = dt.now(IST)
-                                rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
-                                t.target_level = fill - ((t.stop_level - fill) * rr)
+                                t.status = "OPEN"
+
+                                rr = _parse_ratio_string(
+                                    self.cached_settings.get("risk_reward", "1:2"), 2.0
+                                )
+                                t.target_level = fill_price - ((t.stop_level - fill_price) * rr)
+
                                 t.save()
+
                                 self.open_trades[t.symbol] = t
-                            else:
-                                t.status = "CLOSED"; t.exit_price = fill; t.exit_time = dt.now(IST)
-                                t.pnl = (t.entry_price - fill) * t.quantity
+
+                            logger.info(f"CBD RECONCILE: {t.symbol} OPEN @ {fill_price}")
+
+                        # ---------- EXIT COMPLETE ----------
+                        elif trade.status == "PENDING_EXIT" and order_status == "COMPLETE":
+                            with transaction.atomic():
+                                t = (
+                                    CashBreakdownTrade.objects
+                                    .select_for_update()
+                                    .get(id=trade.id)
+                                )
+
+                                if t.status != "PENDING_EXIT":
+                                    continue
+
+                                fill_price = float(order["average_price"])
+                                qty = int(order["filled_quantity"])
+
+                                t.exit_price = fill_price
+                                t.exit_time = dt.now(IST)
+                                t.status = "CLOSED"
+                                t.pnl = (t.entry_price - fill_price) * qty
+
                                 t.save()
-                                redis_client.incrbyfloat(self.daily_pnl_key, t.pnl)
-                                self.open_trades.pop(t.symbol, None)
+
+                                # Redis & RAM cleanup
                                 redis_client.srem(self.exiting_trades_set, str(t.id))
                                 redis_client.srem(self.active_entries_set, t.symbol)
-                        logger.info(f"CBD RECONCILE: {t.symbol} now {t.status} at {fill}")
-                    
-                    elif ord_data['status'] in ["CANCELLED", "REJECTED"]:
-                        with transaction.atomic():
-                            if t.status == "PENDING_ENTRY":
+                                redis_client.incrbyfloat(self.daily_pnl_key, t.pnl)
+
+                                self.open_trades.pop(t.symbol, None)
+
+                            logger.info(
+                                f"CBD RECONCILE: {t.symbol} CLOSED @ {fill_price} | PnL={t.pnl:.2f}"
+                            )
+
+                        # ---------- ENTRY FAILED ----------
+                        elif trade.status == "PENDING_ENTRY" and order_status in ["CANCELLED", "REJECTED"]:
+                            with transaction.atomic():
+                                t = (
+                                    CashBreakdownTrade.objects
+                                    .select_for_update()
+                                    .get(id=trade.id)
+                                )
+
+                                if t.status != "PENDING_ENTRY":
+                                    continue
+
                                 t.status = "FAILED_ENTRY"
+                                t.save()
+
                                 redis_client.decr(self.trade_count_key)
                                 redis_client.srem(self.active_entries_set, t.symbol)
-                            else:
-                                t.status = "OPEN" # Reset to monitor and try exit again
+
+                            logger.warning(f"CBD RECONCILE: ENTRY FAILED {t.symbol}")
+
+                        # ---------- EXIT FAILED ----------
+                        elif trade.status == "PENDING_EXIT" and order_status in ["CANCELLED", "REJECTED"]:
+                            with transaction.atomic():
+                                t = (
+                                    CashBreakdownTrade.objects
+                                    .select_for_update()
+                                    .get(id=trade.id)
+                                )
+
+                                if t.status != "PENDING_EXIT":
+                                    continue
+
+                                t.status = "OPEN"
                                 t.exit_order_id = None
+                                t.save()
+
                                 redis_client.srem(self.exiting_trades_set, str(t.id))
-                            t.save()
-                time.sleep(0.5)
+
+                            logger.warning(f"CBD RECONCILE: EXIT FAILED {t.symbol}")
+
+                    except Exception as e:
+                        logger.error(f"CBD RECONCILE TRADE ERROR [{trade.symbol}]: {e}")
+
+                time.sleep(0.1)
+
             except Exception as e:
-                logger.error(f"CBD RECONCILE ERR: {e}")
+                logger.error(f"CBD RECONCILE LOOP ERROR: {e}")
                 time.sleep(2)
+
 
     def _listen_to_stream(self, stream_key, is_candle=False):
         while self.running:
+            self._update_global_cache() # REFRESH SETTINGS
             try:
-                # Group read with 1s block
-                msgs = redis_client.xreadgroup(self.group_name, self.consumer_name, {stream_key: '>'}, count=100, block=1000)
+                msgs = redis_client.xreadgroup(self.group_name, self.consumer_name, {stream_key: '>'}, count=200, block=1000)
                 if msgs:
                     for _, messages in msgs:
                         ack_ids = []
@@ -1043,6 +1225,7 @@ class CashBreakdownClient:
                                         if now >= self.account.breakdown_start_time and now <= self.account.breakdown_end_time:
                                             self._process_candle(payload)
                                 else:
+                                    # Tick Update
                                     sym = fields.get(b'symbol') or fields.get('symbol')
                                     ltp = fields.get(b'ltp') or fields.get('ltp')
                                     if sym and ltp:
@@ -1053,8 +1236,7 @@ class CashBreakdownClient:
                             except: pass
                         if ack_ids: redis_client.xack(stream_key, self.group_name, *ack_ids)
             except redis.exceptions.ResponseError:
-                self._ensure_consumer_group(stream_key, '0' if is_candle else '$')
-                time.sleep(1)
+                self._ensure_consumer_group(stream_key, '0' if is_candle else '$'); time.sleep(1)
             except: time.sleep(1)
 
     def run(self):
@@ -1062,18 +1244,11 @@ class CashBreakdownClient:
         threading.Thread(target=self._listen_to_stream, args=(CANDLE_STREAM_KEY, True), daemon=True).start()
         threading.Thread(target=self._listen_to_stream, args=(TICK_STREAM_KEY, False), daemon=True).start()
         threading.Thread(target=self._reconcile_loop, daemon=True).start()
-        
-        logger.info(f"CBD: Engine Live for Account {self.account.id}")
-        
+        logger.info("CBD: Engine Started.")
         while self.running:
             close_old_connections()
-            try: 
-                self._update_global_cache()
-                self._try_enter_pending()
-                self.monitor_trades()
-                time.sleep(0.01) # 10ms loop
-            except Exception as e: 
-                logger.error(f"CBD MAIN LOOP ERR: {e}")
-                time.sleep(1)
+            try: self._try_enter_pending(); self.monitor_trades(); time.sleep(0.005)
+            except: time.sleep(1)
 
     def stop(self): self.running = False
+
