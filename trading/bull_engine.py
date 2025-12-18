@@ -451,45 +451,99 @@ class CashBreakoutClient:
     def force_square_off(self, reason):
         for s, t in list(self.open_trades.items()):
             if t.status == "OPEN": self.exit_trade(t, None, reason)
-
     def _reconcile_loop(self):
         while self.running:
             close_old_connections()
             try:
+                # Uses CashBreakoutTrade
                 qs = CashBreakoutTrade.objects.filter(account=self.account, status__in=["PENDING_ENTRY", "PENDING_EXIT"])
-                if qs.exists():
+                if not qs.exists():
+                    time.sleep(1)
+                    continue
+
+                try:
                     all_orders = self.kite.orders()
                     omap = {o['order_id']: o for o in all_orders}
-                    for t in qs:
-                        oid = t.entry_order_id if t.status == "PENDING_ENTRY" else t.exit_order_id
-                        if not oid: 
-                            t.status = "FAILED_ENTRY" if t.status=="PENDING_ENTRY" else "FAILED_EXIT"; t.save()
+                except Exception as ke:
+                    logger.error(f"CB RECONCILE: Kite Error: {ke}")
+                    time.sleep(2)
+                    continue
+
+                for t in qs:
+                    oid = t.entry_order_id if t.status == "PENDING_ENTRY" else t.exit_order_id
+                    if not oid or oid not in omap: continue
+                    
+                    ord_data = omap[oid]
+                    if ord_data['status'] == "COMPLETE":
+                        fill = float(ord_data['average_price'])
+                        if t.status == "PENDING_ENTRY":
+                            t.status = "OPEN"; t.entry_price = fill; t.quantity = int(ord_data['filled_quantity'])
+                            t.entry_time = dt.now(IST)
+                            rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
+                            # Bull Target: Entry + Risk
+                            t.target_level = fill + ((fill - t.stop_level) * rr)
+                            t.save()
+                            self.open_trades[t.symbol] = t
+                            logger.info(f"CB RECONCILE: {t.symbol} OPEN at {fill}")
+                        else:
+                            t.status = "CLOSED"; t.exit_price = fill; t.exit_time = dt.now(IST)
+                            # Bull PnL: Exit - Entry
+                            t.pnl = (fill - t.entry_price) * t.quantity
+                            t.save()
+                            redis_client.incrbyfloat(self.daily_pnl_key, t.pnl)
+                            self.open_trades.pop(t.symbol, None)
+                            redis_client.srem(self.exiting_trades_set, t.id)
                             redis_client.srem(self.active_entries_set, t.symbol)
-                            continue
-                        if oid not in omap: continue
+                    elif ord_data['status'] in ["CANCELLED", "REJECTED"]:
+                        if t.status == "PENDING_ENTRY":
+                            t.status = "FAILED_ENTRY"; t.save()
+                            redis_client.decr(self.trade_count_key)
+                            redis_client.srem(self.active_entries_set, t.symbol)
+                        else:
+                            t.status = "OPEN"; t.exit_order_id = None; t.save()
+                            redis_client.srem(self.exiting_trades_set, t.id)
+                time.sleep(0.1)
+            except Exception as e:
+                logger.error(f"CB RECONCILE ERROR: {e}")
+                time.sleep(2)
+    # def _reconcile_loop(self):
+    #     while self.running:
+    #         close_old_connections()
+    #         try:
+    #             qs = CashBreakoutTrade.objects.filter(account=self.account, status__in=["PENDING_ENTRY", "PENDING_EXIT"])
+    #             if qs.exists():
+    #                 all_orders = self.kite.orders()
+    #                 omap = {o['order_id']: o for o in all_orders}
+    #                 for t in qs:
+    #                     oid = t.entry_order_id if t.status == "PENDING_ENTRY" else t.exit_order_id
+    #                     if not oid: 
+    #                         t.status = "FAILED_ENTRY" if t.status=="PENDING_ENTRY" else "FAILED_EXIT"; t.save()
+    #                         redis_client.srem(self.active_entries_set, t.symbol)
+    #                         continue
+    #                     if oid not in omap: continue
                         
-                        d = omap[oid]; st = d['status']
-                        if st == "COMPLETE":
-                            fill = float(d['average_price'])
-                            if t.status == "PENDING_ENTRY":
-                                t.status = "OPEN"; t.entry_price = fill; t.quantity = int(d['filled_quantity'])
-                                t.entry_time = timezone.now()
-                                rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
-                                t.target_level = fill + ((fill - t.stop_level) * rr)
-                                t.save(); self.open_trades[t.symbol] = t; self.pending_trades.pop(t.symbol, None)
-                            else:
-                                t.status = "CLOSED"; t.exit_price = fill; t.exit_time = timezone.now()
-                                t.pnl = (fill - t.entry_price) * t.quantity
-                                t.save(); redis_client.incrbyfloat(self.daily_pnl_key, t.pnl)
-                                self.open_trades.pop(t.symbol, None); redis_client.srem(self.exiting_trades_set, t.id); redis_client.srem(self.active_entries_set, t.symbol)
-                        elif st in ["CANCELLED", "REJECTED"]:
-                            if t.status == "PENDING_ENTRY":
-                                t.status = "FAILED_ENTRY"; t.save(); redis_client.decr(self.trade_count_key)
-                                redis_client.srem(self.active_entries_set, t.symbol); self.pending_trades.pop(t.symbol, None)
-                            else:
-                                t.status = "OPEN"; t.exit_order_id = None; t.save(); redis_client.srem(self.exiting_trades_set, t.id)
-                time.sleep(0.5)
-            except: time.sleep(1)
+    #                     d = omap[oid]; st = d['status']
+    #                     if st == "COMPLETE":
+    #                         fill = float(d['average_price'])
+    #                         if t.status == "PENDING_ENTRY":
+    #                             t.status = "OPEN"; t.entry_price = fill; t.quantity = int(d['filled_quantity'])
+    #                             t.entry_time = timezone.now()
+    #                             rr = _parse_ratio_string(self.cached_settings.get("risk_reward", "1:2"), 2.0)
+    #                             t.target_level = fill + ((fill - t.stop_level) * rr)
+    #                             t.save(); self.open_trades[t.symbol] = t; self.pending_trades.pop(t.symbol, None)
+    #                         else:
+    #                             t.status = "CLOSED"; t.exit_price = fill; t.exit_time = timezone.now()
+    #                             t.pnl = (fill - t.entry_price) * t.quantity
+    #                             t.save(); redis_client.incrbyfloat(self.daily_pnl_key, t.pnl)
+    #                             self.open_trades.pop(t.symbol, None); redis_client.srem(self.exiting_trades_set, t.id); redis_client.srem(self.active_entries_set, t.symbol)
+    #                     elif st in ["CANCELLED", "REJECTED"]:
+    #                         if t.status == "PENDING_ENTRY":
+    #                             t.status = "FAILED_ENTRY"; t.save(); redis_client.decr(self.trade_count_key)
+    #                             redis_client.srem(self.active_entries_set, t.symbol); self.pending_trades.pop(t.symbol, None)
+    #                         else:
+    #                             t.status = "OPEN"; t.exit_order_id = None; t.save(); redis_client.srem(self.exiting_trades_set, t.id)
+    #             time.sleep(0.5)
+    #         except: time.sleep(1)
 
     def _listen_to_stream(self, stream_key, is_candle=False):
         while self.running:
