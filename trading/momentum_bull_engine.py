@@ -340,7 +340,7 @@ class MomentumBullClient:
     def _initiate_exit(self, trade, reason):
         if not redis_client.sadd(self.exiting_trades_set, trade.id): return
         try:
-            oid = self.kite.place_order(tradingsymbol=trade.symbol, exchange='NSE', transaction_type='SELL', quantity=trade.quantity, order_type='MARKET', product='MIS')
+            oid = self.kite.place_order(tradingsymbol=trade.symbol, exchange='NSE', transaction_type='SELL', quantity=trade.quantity, order_type='MARKET', product='MIS',variety='regular')
             with transaction.atomic():
                 trade.status = 'PENDING_EXIT'; trade.exit_reason = reason; trade.exit_order_id = oid; trade.save()
             self.open_trades.pop(trade.symbol, None); self.pending_orders[trade.symbol] = trade
