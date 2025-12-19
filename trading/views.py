@@ -1,33 +1,39 @@
 import json
-import redis
 import logging
-from datetime import datetime, time
+from datetime import datetime
 from django.shortcuts import render, redirect
 from django.http import JsonResponse
-from django.conf import settings
-from django.contrib.auth.decorators import login_required
 from django.views.decorators.csrf import csrf_exempt
+from django.contrib.auth.decorators import login_required
 from kiteconnect import KiteConnect
+from django.conf import settings
+
 from .models import Account, CashBreakoutTrade, CashBreakdownTrade, MomentumBullTrade, MomentumBearTrade
-from .forms import AccountForm
+from .hft_utils import get_redis_client # Safe Redis client
 
-# --- Redis Connection (Nexus ke saath consistent keys) ---
-r = redis.from_url(settings.REDIS_URL, decode_responses=True)
-logger = logging.getLogger("Views")
+logger = logging.getLogger("TradingViews")
 
+# --- DASHBOARD RENDER ---
+
+@login_required
 def home(request):
-    """Dashboard render karega"""
+    """Main Dashboard render karega"""
     account = Account.objects.first()
     return render(request, 'dashboard.html', {'account': account})
 
-# --- Kite Connect Authentication ---
+# --- ZERODHA / KITE AUTHENTICATION ---
 
+@login_required
 def kite_login(request):
     """Zerodha login page par redirect karega"""
     acc = Account.objects.first()
+    if not acc or not acc.api_key:
+        return JsonResponse({'status': 'error', 'message': 'API Key not found in Account model'})
+    
     kite = KiteConnect(api_key=acc.api_key)
     return redirect(kite.login_url())
 
+@login_required
 def kite_callback(request):
     """Zerodha se access token lekar DB mein save karega"""
     request_token = request.GET.get('request_token')
@@ -38,23 +44,28 @@ def kite_callback(request):
         data = kite.generate_session(request_token, api_secret=acc.api_secret)
         acc.access_token = data['access_token']
         acc.save()
-        # Nexus ko naya token milne ke liye restart ki zarurat hogi agar wo chalu hai
-        return redirect('/dashboard/')
+        # Redis mein bhi update kar dein taaki engines ko turant mil jaye
+        r = get_redis_client()
+        r.set(f"hft:access_token:{acc.user.id}", data['access_token'])
+        return redirect('/')
     except Exception as e:
+        logger.error(f"Kite Login Failed: {e}")
         return JsonResponse({'status': 'error', 'message': str(e)})
 
-# --- Dashboard API Endpoints ---
+# --- HFT API ENDPOINTS ---
 
-def dashboard_stats(request):
+@login_required
+def stats_view(request):
     """PnL, Heartbeat aur Engine status supply karega"""
-    # 1. Heartbeat check (Nexus har 1s update karta hai)
+    r = get_redis_client()
     last_heartbeat = r.get("algo:data:heartbeat")
+    
     is_live = False
     if last_heartbeat:
-        if int(datetime.now().timestamp()) - int(last_heartbeat) < 10:
+        if int(datetime.now().timestamp()) - int(last_heartbeat) < 15:
             is_live = True
 
-    # 2. Engine status sync
+    # Engine toggle status from Redis
     status = {
         'bull': r.get("algo:engine:bull:enabled") or "0",
         'bear': r.get("algo:engine:bear:enabled") or "0",
@@ -62,7 +73,7 @@ def dashboard_stats(request):
         'mom_bear': r.get("algo:engine:mom_bear:enabled") or "0",
     }
 
-    # 3. Simple P&L Aggregation from DB (Mock logic)
+    # P&L Logic (Inhe aap real calculations se replace kar sakte hain)
     pnl_data = {
         'total': 0.00,
         'bull': 0.00,
@@ -78,70 +89,95 @@ def dashboard_stats(request):
     })
 
 @csrf_exempt
-def engine_settings_view(request, engine_type):
-    """Engine specific settings (RR, Trailing, Vol) handle karega"""
-    redis_key = f"algo:settings:{engine_type}"
+@login_required
+def control_view(request):
+    """Buttons (Toggle, Panic, Ban, Exit) handle karega"""
+    if request.method != "POST":
+        return JsonResponse({"status": "failed"}, status=400)
+        
+    data = json.loads(request.body)
+    action = data.get('action')
+    r = get_redis_client()
     
-    if request.method == 'GET':
-        # Redis se settings uthayein
-        data = r.get(redis_key)
-        return JsonResponse(json.loads(data) if data else {})
+    if action == 'toggle_engine':
+        side = data.get('side')
+        enabled = "1" if data.get('enabled') else "0"
+        r.set(f"algo:engine:{side}:enabled", enabled)
+        return JsonResponse({'status': 'success', 'side': side, 'enabled': enabled})
+
+    elif action == 'panic_exit':
+        side = data.get('side')
+        r.set(f"algo:panic:{side}", "1", ex=60) 
+        return JsonResponse({'status': 'panic_signal_sent'})
+
+    elif action == 'manual_exit':
+        symbol = data.get('symbol')
+        r.set(f"algo:manual_exit:{symbol}", "1", ex=20)
+        return JsonResponse({'status': 'exit_sent', 'symbol': symbol})
+
+    elif action == 'ban_symbol':
+        symbol = data.get('symbol').upper()
+        r.sadd("algo:banned_symbols", symbol)
+        return JsonResponse({'status': 'success', 'banned': symbol})
+
+    return JsonResponse({'status': 'invalid_action'})
+
+@csrf_exempt
+@login_required
+def engine_settings_view(request, side):
+    """Engine specific settings (Matrix, RR, Trailing)"""
+    r = get_redis_client()
+    redis_key = f"algo:settings:{side}"
     
-    elif request.method == 'POST':
-        # Dashboard se aayi nayi settings Redis mein save karein
+    if request.method == 'POST':
         try:
             settings_data = json.loads(request.body)
             r.set(redis_key, json.dumps(settings_data))
-            # Nexus background poller ise automatically RAM mein cache kar lega
+            
+            # DB mein bhi update karein (Agar model fields aligned hain)
+            acc = Account.objects.get(user=request.user)
+            if side == 'bull': acc.bull_volume_settings_json = json.dumps(settings_data)
+            elif side == 'bear': acc.bear_volume_settings_json = json.dumps(settings_data)
+            acc.save()
+            
             return JsonResponse({'status': 'success'})
         except Exception as e:
             return JsonResponse({'status': 'error', 'message': str(e)})
 
-@csrf_exempt
-def control_action(request):
-    """Buttons (Toggle, Panic, Ban) handle karega"""
-    data = json.loads(request.body)
-    action = data.get('action')
-    
-    if action == 'toggle_engine':
-        side = data.get('side') # bull, bear, etc.
-        enabled = "1" if data.get('enabled') else "0"
-        r.set(f"algo:engine:{side}:enabled", enabled)
-        return JsonResponse({'status': 'success'})
+    # GET request
+    data = r.get(redis_key)
+    return JsonResponse(json.loads(data) if data else {})
 
-    elif action == 'panic_exit':
-        side = data.get('side')
-        r.set(f"algo:panic:{side}", "1") # Nexus ise check karke square off kar dega
-        return JsonResponse({'status': 'success'})
-
-    elif action == 'ban_symbol':
-        symbol = data.get('symbol')
-        r.sadd("algo:banned_symbols", symbol) # Redis set mein add karein
-        return JsonResponse({'status': 'success'})
-
-    return JsonResponse({'status': 'invalid_action'})
-
+@login_required
 def get_orders(request):
     """Active aur Closed orders database se fetch karega"""
-    # Nexus async worker in models mein data fill karta hai
     orders = {
-        'bull': list(CashBreakoutTrade.objects.order_by('-id')[:5].values()),
-        'bear': list(CashBreakdownTrade.objects.order_by('-id')[:5].values()),
-        'mom_bull': list(MomentumBullTrade.objects.order_by('-id')[:5].values()),
-        'mom_bear': list(MomentumBearTrade.objects.order_by('-id')[:5].values()),
+        'bull': list(CashBreakoutTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
+        'bear': list(CashBreakdownTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
+        'mom_bull': list(MomentumBullTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
+        'mom_bear': list(MomentumBearTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
     }
     return JsonResponse(orders)
 
+@login_required
 def get_scanner_data(request):
-    """Nexus jo signals Redis mein push karta hai unhe fetch karega"""
-    # Nexus 'algo:scanner:signals' key mein JSON list maintain karega
+    """Nexus signals fetch karega"""
+    r = get_redis_client()
     raw_signals = r.get("algo:scanner:signals")
     signals = json.loads(raw_signals) if raw_signals else []
     
-    # Dashboard panels ke hisab se filter karein (Simple mock logic)
     return JsonResponse({
-        'bull': [s for s in signals if s['type'] == 'BULL'],
-        'bear': [s for s in signals if s['type'] == 'BEAR'],
-        'mom_bull': [s for s in signals if s['type'] == 'MOM_BULL'],
-        'mom_bear': [s for s in signals if s['type'] == 'MOM_BEAR'],
+        'bull': [s for s in signals if s.get('type') == 'BULL'],
+        'bear': [s for s in signals if s.get('type') == 'BEAR'],
+        'mom_bull': [s for s in signals if s.get('type') == 'MOM_BULL'],
+        'mom_bear': [s for s in signals if s.get('type') == 'MOM_BEAR'],
     })
+
+@csrf_exempt
+@login_required
+def global_settings_view(request):
+    """
+    FIX: missing function jiske liye urls.py crash ho raha tha.
+    Yahan aap pure system ki global configurations save kar sakte hain.
+    """
+    return JsonResponse({"status": "global_config_active"})
