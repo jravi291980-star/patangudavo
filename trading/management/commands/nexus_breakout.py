@@ -17,8 +17,8 @@ from kiteconnect import KiteTicker, KiteConnect
 from trading.models import Account, CashBreakoutTrade, CashBreakdownTrade
 from trading.hft_utils import get_redis_client, LUA_INC_LIMIT
 
-# --- Logging Setup (Heroku console mate) ---
-# Logging ne sys.stdout par redirect karyu che jethi Heroku logs ma badhu dekhay
+# --- Heroku Console Logging Setup ---
+# Saare logs sys.stdout par redirect hain taaki Heroku Dashboard aur CLI par real-time dikhein
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
@@ -28,54 +28,56 @@ logger = logging.getLogger("Nexus_Breakout")
 IST = pytz.timezone("Asia/Kolkata")
 
 class Command(BaseCommand):
-    help = 'HFT Cash Breakout Engine (Nexus 1) ne start kare che'
+    help = 'Nexus 1: Cash Breakout HFT Engine with Verbose Monitoring'
 
     def add_arguments(self, parser):
         parser.add_argument('--user_id', type=int, default=1)
 
     def handle(self, *args, **options):
         user_id = options['user_id']
-        self.stdout.write(self.style.SUCCESS(f'--- Nexus 1: Breakout Engine User {user_id} mate chalu thay che ---'))
+        self.stdout.write(self.style.SUCCESS(f'--- NEXUS 1: BREAKOUT ENGINE STARTING (User ID: {user_id}) ---'))
         
         try:
             engine = BreakoutNexus(user_id=user_id)
             engine.run()
         except Exception as e:
-            logger.error(f"Critical Engine Failure: {e}", exc_info=True)
+            logger.error(f"ENGINE CRITICAL CRASH: {e}", exc_info=True)
             self.stdout.write(self.style.ERROR(f'Engine Crash: {e}'))
 
 class BreakoutNexus:
     def __init__(self, user_id):
         self.user_id = user_id
-        # Heroku SSL Ready Redis Client
+        # Safe Redis Client (Heroku SSL Compatibility Integrated)
         self.r = get_redis_client()
         
-        # 1. DB mathi Account details load karo
+        # 1. Database se account details fetch karna
         self.acc = Account.objects.get(user__id=user_id)
         if not self.acc.access_token:
-            raise Exception("Access Token nathi malyo! Dashboard thi login karo.")
+            raise Exception("Access Token missing! Pehle Dashboard se login kijiye.")
             
         self.kite = KiteConnect(api_key=self.acc.api_key)
         self.kite.set_access_token(self.acc.access_token)
         self.kws = KiteTicker(self.acc.api_key, self.acc.access_token)
         
-        # --- ZERO-LATENCY RAM STATE (Pure Python Dictionaries) ---
-        self.stocks = {}        # 1700 stocks state
+        # --- ZERO-LATENCY RAM STATE ---
+        self.stocks = {}        # 1700 Stocks cache
         self.open_trades = {}   # Active positions monitoring
-        self.config = {}        # Dashboard parameter cache
+        self.config = {}        # Settings cache
         self.banned_set = set()
         self.engine_live = {'bull': False, 'bear': False}
-        self.tick_count = 0
         
-        # Initial Cache Load
+        # Monitoring Metrics
+        self.tick_count = 0
+        self.last_summary_time = time.time()
+        
+        # Initial Cache aur Config Sync
         self._load_morning_cache()
         self._sync_dashboard_params()
 
     def _load_morning_cache(self):
-        """OHLC ane SMA data ne RAM ma load karva mate"""
-        logger.info("RAM ma Cache build thai rahyu che...")
+        """OHLC aur SMA data ko Redis se RAM mein load karna (O(1) Lookup)"""
+        logger.info("Initializing RAM Cache: Fetching Seeds from Redis...")
         
-        # Redis mathi data fetch karo
         instr_map = json.loads(self.r.get('instrument_map') or '{}')
         pdl_map = self.r.hgetall('prev_day_ohlc')
         sma_map = self.r.hgetall('algo:fixed_vol_sma')
@@ -105,29 +107,23 @@ class BreakoutNexus:
                 'last_vol': 0,
                 'last_ltp': 0
             }
-        logger.info(f"Cache Ready: {len(self.stocks)} stocks monitor thai rahya che.")
+        logger.info(f"CACHE READY: {len(self.stocks)} stocks cached successfully.")
 
     def _sync_dashboard_params(self):
-        """Dashboard settings ane status ne RAM ma sync karva mate"""
+        """Settings ko RAM mein refresh karna (har 2 sec)"""
         for side in ['bull', 'bear']:
             raw_data = self.r.get(f"algo:settings:{side}")
             data = json.loads(raw_data) if raw_data else {}
             
-            # RR ane TSL parsing
-            rr_val = 2.0
-            if 'risk_reward' in data and ':' in str(data['risk_reward']):
-                rr_val = float(data['risk_reward'].split(':')[1])
-            
-            tsl_val = 1.5
-            if 'trailing_sl' in data and ':' in str(data['trailing_sl']):
-                tsl_val = float(data['trailing_sl'].split(':')[1])
+            # RR/TSL Format parsing (e.g., '1:2')
+            rr = float(data.get('risk_reward', '1:2').split(':')[1]) if ':' in str(data.get('risk_reward')) else 2.0
+            tsl = float(data.get('trailing_sl', '1:1.5').split(':')[1]) if ':' in str(data.get('trailing_sl')) else 1.5
 
             self.config[side] = {
                 'max_total': int(data.get('total_trades', 5)),
                 'max_per_stock': int(data.get('trades_per_stock', 2)),
-                'rr': rr_val,
-                'tsl': tsl_val,
-                'vol_matrix': data.get('volume_criteria', []), # 10 Levels integration
+                'rr': rr, 'tsl': tsl,
+                'vol_matrix': data.get('volume_criteria', []), # 10 Levels Matrix
                 'risk_tiers': [
                     float(data.get('risk_trade_1', 2000)),
                     float(data.get('risk_trade_2', 1500)),
@@ -139,39 +135,27 @@ class BreakoutNexus:
         self.engine_live['bull'] = self.r.get("algo:engine:bull:enabled") == "1"
         self.engine_live['bear'] = self.r.get("algo:engine:bear:enabled") == "1"
 
-    def _is_vol_qualified(self, token, candle, side):
-        """10-Level Volume SMA Matrix checking logic"""
-        stock = self.stocks[token]
-        matrix = self.config[side]['vol_matrix']
-        if not matrix: return False
-
-        c_vol = candle['volume']
-        c_close = candle['close']
-        s_sma = stock['sma']
-
-        for level in matrix:
-            try:
-                # Minimum Average SMA check
-                if s_sma < float(level.get('min_sma_avg', 0)): continue 
-                # SMA Multiplier spike check
-                if c_vol < (s_sma * float(level.get('sma_multiplier', 1))): continue
-                # Volume Price in Crores check
-                vol_cr = (c_vol * c_close) / 10000000.0
-                if vol_cr >= float(level.get('min_vol_price_cr', 0)):
-                    return True
-            except: continue
-        return False
+    def on_connect(self, ws, response):
+        """WebSocket connect hone par subscription handle karna"""
+        logger.info("WEBSOCKET: Successfully connected to Kite Ticker.")
+        tokens = list(self.stocks.keys())
+        ws.subscribe(tokens)
+        ws.set_mode(ws.MODE_FULL, tokens)
+        logger.info(f"SUBSCRIPTION: Monitoring {len(tokens)} tokens in FULL mode.")
 
     def on_ticks(self, ws, ticks):
-        """HOT PATH: High-speed websocket loop"""
+        """HOT PATH: High Frequency logic execution"""
         now = dt.now(IST)
         bucket = now.replace(second=0, microsecond=0)
         
         self.tick_count += len(ticks)
-        # Dashboard mate heartbeat ane periodic ALIVE log
-        if self.tick_count % 1000 == 0:
-            self.r.set("algo:data:heartbeat", int(now.timestamp()), ex=15)
-            logger.info(f"ALIVE: Tick Count {self.tick_count} | Last Price: {ticks[0]['last_price']}")
+        
+        # 1. ALIVE Summary: Har 10 second mein monitoring state log karna
+        if time.time() - self.last_summary_time > 10:
+            self.r.set("algo:data:heartbeat", int(now.timestamp()), ex=20)
+            logger.info(f"ALIVE: Processed {self.tick_count} ticks | Active Positions: {len(self.open_trades)} | Heartbeat Sent")
+            self.last_summary_time = time.time()
+            self._sync_dashboard_params()
 
         for tick in ticks:
             token = tick.get('instrument_token')
@@ -182,89 +166,96 @@ class BreakoutNexus:
             vol = tick.get('volume_traded', 0)
             stock['last_ltp'] = ltp
 
-            # 1. EXIT MONITORING (Pehli priority)
+            # --- STEP 1: EXIT MONITORING (Priority 1) ---
             if stock['status'] == 'OPEN':
-                # Manual exit check
-                if self.r.get(f"algo:manual_exit:{stock['symbol']}") == "1":
-                    logger.info(f"MANUAL EXIT triggered for {stock['symbol']}")
-                    self._fire_hft_order(token, 'EXIT', ltp, 0, "MANUAL_EXIT")
-                    self.r.delete(f"algo:manual_exit:{stock['symbol']}")
-                    continue
                 self._manage_exit_and_tsl(token, ltp)
                 continue
 
-            # 2. TRIGGER WATCH (6-min timer check)
+            # --- STEP 2: TRIGGER WATCH (6-min Breakout Window) ---
             if stock['status'] == 'TRIGGER_WATCH':
-                # Timer check: 6 minute pachi reset
+                # Timer expiry check
                 if (now - stock['trigger_at']).total_seconds() > 360:
-                    logger.info(f"TIMER EXPIRED: {stock['symbol']} reset to PENDING")
                     stock['status'] = 'PENDING'
                     continue
                 
-                # 0.01% Entry Buffer
+                # Signal hit check (with 0.01% Buffer)
                 if stock['side_latch'] == 'BULL' and ltp > stock['trigger_px']:
-                    logger.info(f"BREAKOUT HIT: {stock['symbol']} Buy @ {ltp}")
+                    logger.info(f"SIGNAL HIT: {stock['symbol']} Breakout above {stock['trigger_px']} @ LTP: {ltp}")
                     self._fire_hft_order(token, 'BUY', ltp, stock['stop_base'], "BULL_BREAKOUT")
                 elif stock['side_latch'] == 'BEAR' and ltp < stock['trigger_px']:
-                    logger.info(f"BREAKDOWN HIT: {stock['symbol']} Sell @ {ltp}")
+                    logger.info(f"SIGNAL HIT: {stock['symbol']} Breakdown below {stock['trigger_px']} @ LTP: {ltp}")
                     self._fire_hft_order(token, 'SELL', ltp, stock['stop_base'], "BEAR_BREAKDOWN")
                 continue
 
-            # 3. CANDLE AGGREGATION (1-min candle build karo)
+            # --- STEP 3: CANDLE AGGREGATION & BREAKOUT CANDLE DETECTION ---
             if stock['candle'] and stock['candle']['bucket'] != bucket:
+                # 2. CANDLE DONE: Jab 1-min puri ho jaye
                 self._check_for_signal(token, stock['candle'])
                 stock['candle'] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': 0}
             elif not stock['candle']:
                 stock['candle'] = {'bucket': bucket, 'open': ltp, 'high': ltp, 'low': ltp, 'close': ltp, 'volume': 0}
             else:
                 c = stock['candle']
-                c['high'] = max(c['high'], ltp)
-                c['low'] = min(c['low'], ltp)
-                c['close'] = ltp
-                if stock['last_vol'] > 0:
-                    c['volume'] += max(0, vol - stock['last_vol'])
+                c['high'] = max(c['high'], ltp); c['low'] = min(c['low'], ltp); c['close'] = ltp
+                if stock['last_vol'] > 0: c['volume'] += max(0, vol - stock['last_vol'])
             
             stock['last_vol'] = vol
 
     def _check_for_signal(self, token, candle):
-        """Candle complete thay tyare strategy conditions check kare che"""
+        """Completed candle par strategy rules check karna"""
         stock = self.stocks[token]
         if stock['status'] != 'PENDING': return
 
-        # BULL Check
+        # BULL Conditions: Prev High break + 10-level Matrix qualify
         if self.engine_live['bull'] and candle['open'] < stock['prev_high'] < candle['close']:
             if self._is_vol_qualified(token, candle, 'bull'):
                 if stock['stock_trades'] < self.config['bull']['max_per_stock']:
-                    logger.info(f"SIGNAL: {stock['symbol']} Bull candidate found")
-                    stock['status'] = 'TRIGGER_WATCH'
-                    stock['side_latch'] = 'BULL'
-                    stock['trigger_px'] = candle['high'] * 1.0001 # 0.01% Entry Buffer
+                    # 3. SIGNAL DETECTED: Breakout candidate identify hua
+                    logger.info(f"SIGNAL DETECTED: {stock['symbol']} Bull Breakout Candidate | V: {candle['volume']} | C: {candle['close']}")
+                    stock['status'] = 'TRIGGER_WATCH'; stock['side_latch'] = 'BULL'
+                    stock['trigger_px'] = candle['high'] * 1.0001
                     stock['trigger_at'] = dt.now(IST)
                     stock['stop_base'] = stock['prev_high'] if (candle['high'] - candle['low'])/candle['close'] > 0.007 else candle['low']
 
-        # BEAR Check
+        # BEAR Conditions: Prev Low break + 10-level Matrix qualify
         elif self.engine_live['bear'] and candle['open'] > stock['prev_low'] > candle['close']:
             if self._is_vol_qualified(token, candle, 'bear'):
                 if stock['stock_trades'] < self.config['bear']['max_per_stock']:
-                    logger.info(f"SIGNAL: {stock['symbol']} Bear candidate found")
-                    stock['status'] = 'TRIGGER_WATCH'
-                    stock['side_latch'] = 'BEAR'
-                    stock['trigger_px'] = candle['low'] * 0.9999 # 0.01% Entry Buffer
+                    logger.info(f"SIGNAL DETECTED: {stock['symbol']} Bear Breakdown Candidate | V: {candle['volume']} | C: {candle['close']}")
+                    stock['status'] = 'TRIGGER_WATCH'; stock['side_latch'] = 'BEAR'
+                    stock['trigger_px'] = candle['low'] * 0.9999
                     stock['trigger_at'] = dt.now(IST)
                     stock['stop_base'] = stock['prev_low'] if (candle['high'] - candle['low'])/candle['close'] > 0.007 else candle['high']
 
+    def _is_vol_qualified(self, token, candle, side):
+        """10-Level Volume SMA Matrix checking logic"""
+        stock = self.stocks[token]
+        matrix = self.config[side]['vol_matrix']
+        if not matrix: return False
+        c_vol = candle['volume']; c_close = candle['close']; s_sma = stock['sma']
+
+        for level in matrix:
+            try:
+                if s_sma < float(level.get('min_sma_avg', 0)): continue 
+                if c_vol < (s_sma * float(level.get('sma_multiplier', 1))): continue
+                if (c_vol * c_close) / 10000000.0 >= float(level.get('min_vol_price_cr', 0)):
+                    # CANDLE DONE log for high volume candles
+                    logger.info(f"CANDLE QUALIFIED: {stock['symbol']} Level Hit: SMA-Mult {level.get('sma_multiplier')}")
+                    return True
+            except: continue
+        return False
+
     def _manage_exit_and_tsl(self, token, ltp):
-        """Step-wise Trailing ane 0.02% Exit Buffer monitoring"""
+        """Position management with Trailing SL and 0.02% Exit Buffer"""
         trade = self.open_trades.get(token)
         if not trade: return
 
         if trade['side'] == 'BUY':
-            # Target/SL with buffer
             if ltp >= (trade['target'] * 1.0002) or ltp <= (trade['sl'] * 0.9998):
-                logger.info(f"EXIT TRIGGER: {self.stocks[token]['symbol']} Bull exit @ {ltp}")
+                logger.info(f"POSITION EXIT: {self.stocks[token]['symbol']} Bull Exit @ {ltp}")
                 self._fire_hft_order(token, 'SELL', ltp, 0, "BULL_EXIT")
                 return
-            # Trailing SL logic
+            # Step Trailing
             profit = ltp - trade['entry_px']
             if profit >= trade['step']:
                 lvls = floor(profit / trade['step'])
@@ -273,7 +264,7 @@ class BreakoutNexus:
 
         elif trade['side'] == 'SELL':
             if ltp <= (trade['target'] * 0.9998) or ltp >= (trade['sl'] * 1.0002):
-                logger.info(f"EXIT TRIGGER: {self.stocks[token]['symbol']} Bear exit @ {ltp}")
+                logger.info(f"POSITION EXIT: {self.stocks[token]['symbol']} Bear Exit @ {ltp}")
                 self._fire_hft_order(token, 'BUY', ltp, 0, "BEAR_EXIT")
                 return
             profit = trade['entry_px'] - ltp
@@ -283,43 +274,43 @@ class BreakoutNexus:
                 if new_sl < trade['sl']: trade['sl'] = round(new_sl * 20) / 20
 
     def _fire_hft_order(self, token, side, price, stop_base, reason):
-        """Thread-safe handoff for Kite order execution"""
+        """Atomic Handoff to async execution engine"""
         stock = self.stocks[token]
-        # Memory latch to prevent ghost entries
         stock['status'] = 'EXECUTING'
         asyncio.run_coroutine_threadsafe(self._async_kite_execute(token, side, price, stop_base, reason), self.loop)
 
     async def _async_kite_execute(self, token, side, price, stop_base, reason):
-        """Kite API interact kare che ane Slippage sync kare che"""
+        """API interaction and Slippage Price Sync"""
         stock = self.stocks[token]
         label = side.lower() if side in ['BUY', 'SELL'] else ('bull' if 'BULL' in reason else 'bear')
         
         try:
-            # 1. LUA Counter check (Race condition protection)
+            # 1. Atomic Counter Check
             if side in ['BUY', 'SELL']:
                 if self.r.eval(LUA_INC_LIMIT, 1, f"hft:count:{self.user_id}:{label}", self.config[label]['max_total']) == -1:
-                    logger.warning(f"LIMIT REACHED: {label} trades closed for today.")
+                    logger.warning(f"LIMIT BLOCKED: {label} trades limit reached.")
                     stock['status'] = 'PENDING'; return
 
-            # 2. Risk Tier based Quantity
+            # 2. Risk based Quantity
             risk_tier = self.config[label]['risk_tiers'][min(stock['stock_trades'], 2)]
             risk_val = abs(price - stop_base)
             qty = max(1, int(floor(risk_tier / risk_val))) if risk_val > 0 else 1
 
-            # 3. Market MIS Order fire karo
+            # 3. Kite MIS Order Fire
             oid = self.kite.place_order(
                 tradingsymbol=stock['symbol'], exchange='NSE', transaction_type=side,
                 quantity=qty, order_type='MARKET', product='MIS', variety='regular'
             )
+            logger.info(f"ORDER PLACED: {stock['symbol']} {side} | Qty: {qty} | OID: {oid}")
 
-            # 4. SLIPPAGE SYNC: Actual Avg execution price fetch karo
+            # 4. SLIPPAGE SYNC: Actual Demat Average Price fetch karna
             actual_px = price
-            await asyncio.sleep(0.2) # 200ms wait for Kite to update
+            await asyncio.sleep(0.2)
             try:
                 hist = self.kite.order_history(oid)
                 if hist[-1]['status'] == 'COMPLETE':
                     actual_px = float(hist[-1]['average_price'])
-            except: pass # Fallback to tick price
+            except: pass 
             
             # 5. Position Memory management
             if side in ['BUY', 'SELL']:
@@ -331,39 +322,35 @@ class BreakoutNexus:
                     'target': actual_px + (risk * self.config[label]['rr']) if side == 'BUY' else actual_px - (risk * self.config[label]['rr']),
                     'step': risk * self.config[label]['tsl'], 'oid': oid
                 }
-                logger.info(f"HFT SUCCESS: {stock['symbol']} {side} @ {actual_px}")
+                logger.info(f"SUCCESS: {stock['symbol']} Position Opened @ {actual_px}")
             else:
                 stock['status'] = 'CLOSED'
                 self.open_trades.pop(token, None)
-                logger.info(f"HFT EXIT SUCCESS: {stock['symbol']} closed @ {actual_px}")
+                logger.info(f"SUCCESS: {stock['symbol']} Position Closed @ {actual_px}")
 
         except Exception as e:
-            logger.error(f"Execution API Error: {e}")
+            logger.error(f"KITE API EXECUTION ERR: {e}")
             stock['status'] = 'PENDING'
 
     async def settings_poller(self):
-        """Dashboard parameters ne har 2 sec ma refresh kare che"""
+        """Dashboard settings sync worker"""
         while True:
             try:
                 self._sync_dashboard_params()
-                # Heroku DB safety mate connections refresh
-                close_old_connections()
+                close_old_connections() # Heroku DB security
                 await asyncio.sleep(2)
             except: pass
 
     def run(self):
-        """Main starting point"""
+        """Engine startup"""
         self.loop = asyncio.new_event_loop()
-        # Background event loop chalu karo
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         
-        # Async tasks register karo
         asyncio.run_coroutine_threadsafe(self.settings_poller(), self.loop)
         
-        # Kite Ticker chalu karo
+        self.kws.on_connect = self.on_connect
         self.kws.on_ticks = self.on_ticks
         self.kws.connect(threaded=True)
         
-        # Main thread ne jivant rakhva mate loop
         while True:
             time.sleep(1)
