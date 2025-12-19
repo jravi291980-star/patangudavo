@@ -6,7 +6,8 @@ class Account(models.Model):
     Kite API credentials aur strategy ki global settings store karne ke liye.
     """
     user = models.OneToOneField(User, on_delete=models.CASCADE)
-    
+    is_master = models.BooleanField(default=False, help_text="Designate as master for fetching instruments")
+
     # API Credentials
     api_key = models.CharField(max_length=100)
     api_secret = models.CharField(max_length=100)
