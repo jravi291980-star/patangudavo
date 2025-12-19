@@ -5,10 +5,14 @@ from django.shortcuts import render, redirect
 from django.http import JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.contrib.auth.decorators import login_required
+from django.db.models import Sum
 from kiteconnect import KiteConnect
 from django.conf import settings
 
-from .models import Account, CashBreakoutTrade, CashBreakdownTrade, MomentumBullTrade, MomentumBearTrade
+from .models import (
+    Account, CashBreakoutTrade, CashBreakdownTrade, 
+    MomentumBullTrade, MomentumBearTrade, BannedSymbol
+)
 from .hft_utils import get_redis_client
 
 logger = logging.getLogger("TradingViews")
@@ -17,8 +21,8 @@ logger = logging.getLogger("TradingViews")
 
 @login_required
 def home(request):
-    """Main Dashboard render karega"""
-    account = Account.objects.first()
+    """Main Dashboard render karega - Path is 'trading/dashboard.html'"""
+    account = Account.objects.filter(user=request.user).first()
     return render(request, 'trading/dashboard.html', {'account': account})
 
 # --- ZERODHA / KITE AUTHENTICATION ---
@@ -26,9 +30,9 @@ def home(request):
 @login_required
 def kite_login(request):
     """Zerodha login page par redirect karega"""
-    acc = Account.objects.first()
+    acc = Account.objects.filter(user=request.user).first()
     if not acc or not acc.api_key:
-        return JsonResponse({'status': 'error', 'message': 'API Key not found in Account model'})
+        return JsonResponse({'status': 'error', 'message': 'API Details missing! Modal me API Key bhariye.'})
     
     kite = KiteConnect(api_key=acc.api_key)
     return redirect(kite.login_url())
@@ -37,36 +41,39 @@ def kite_login(request):
 def kite_callback(request):
     """Zerodha se access token lekar DB mein save karega"""
     request_token = request.GET.get('request_token')
-    acc = Account.objects.first()
+    acc = Account.objects.filter(user=request.user).first()
     kite = KiteConnect(api_key=acc.api_key)
     
     try:
         data = kite.generate_session(request_token, api_secret=acc.api_secret)
         acc.access_token = data['access_token']
         acc.save()
-        # Redis mein update
+        
+        # Redis sync for Engines
         r = get_redis_client()
         r.set(f"hft:access_token:{acc.user.id}", data['access_token'])
         return redirect('/')
     except Exception as e:
         logger.error(f"Kite Login Failed: {e}")
-        return JsonResponse({'status': 'error', 'message': str(e)})
+        return redirect('/?error=login_failed')
 
-# --- HFT API ENDPOINTS (Names Matched to URLs) ---
+# --- DASHBOARD LIVE API ---
 
 @login_required
 def dashboard_stats(request):
-    """PnL, Heartbeat aur Engine status supply karega"""
+    """Live PnL, Heartbeat aur Sentiment supply karega"""
     r = get_redis_client()
-    last_heartbeat = r.get("algo:data:heartbeat")
     
+    # 1. Data Connection Check (Heartbeat)
+    hb = r.get("algo:data:heartbeat")
     is_live = False
-    if last_heartbeat and not isinstance(r, object): # Mock check
+    if hb:
         try:
-            if int(datetime.now().timestamp()) - int(last_heartbeat) < 15:
+            if int(datetime.now().timestamp()) - int(hb) < 15:
                 is_live = True
         except: pass
 
+    # 2. Engine Status Toggles
     status = {
         'bull': r.get("algo:engine:bull:enabled") or "0",
         'bear': r.get("algo:engine:bear:enabled") or "0",
@@ -74,21 +81,40 @@ def dashboard_stats(request):
         'mom_bear': r.get("algo:engine:mom_bear:enabled") or "0",
     }
 
-    pnl_data = {'total': 0.0, 'bull': 0.0, 'bear': 0.0, 'mom_bull': 0.0, 'mom_bear': 0.0}
+    # 3. Live P&L Aggregation from DB (Real-time sum)
+    def get_pnl(model):
+        res = model.objects.filter(user=request.user).aggregate(Sum('pnl'))['pnl__sum']
+        return float(res) if res else 0.0
 
+    pnl_data = {
+        'bull': get_pnl(CashBreakoutTrade),
+        'bear': get_pnl(CashBreakdownTrade),
+        'mom_bull': get_pnl(MomentumBullTrade),
+        'mom_bear': get_pnl(MomentumBearTrade),
+    }
+    pnl_data['total'] = sum(pnl_data.values())
+
+    # 4. Sentiment Calculation (Scanner se kitne Bull vs Bear signals hain)
+    raw_signals = r.get("algo:scanner:signals")
+    signals = json.loads(raw_signals) if raw_signals else []
+    bull_count = len([s for s in signals if 'BULL' in s.get('type', '')])
+    bear_count = len([s for s in signals if 'BEAR' in s.get('type', '')])
+    
     return JsonResponse({
         'data_connected': is_live,
         'engine_status': status,
-        'pnl': pnl_data
+        'pnl': pnl_data,
+        'sentiment': {
+            'bull': bull_count,
+            'bear': bear_count,
+            'pct': int((bull_count / (bull_count + bear_count) * 100)) if (bull_count + bear_count) > 0 else 0
+        }
     })
 
 @csrf_exempt
 @login_required
 def control_action(request):
-    """Buttons (Toggle, Panic, Ban, Exit) handle karega"""
-    if request.method != "POST":
-        return JsonResponse({"status": "failed"}, status=400)
-        
+    """Dashboard buttons (Toggle, Panic, Ban, Exit, Save API) handle karega"""
     data = json.loads(request.body)
     action = data.get('action')
     r = get_redis_client()
@@ -97,74 +123,91 @@ def control_action(request):
         side = data.get('side')
         enabled = "1" if data.get('enabled') else "0"
         r.set(f"algo:engine:{side}:enabled", enabled)
-        return JsonResponse({'status': 'success', 'side': side, 'enabled': enabled})
+        return JsonResponse({'status': 'success'})
+
+    elif action == 'save_api':
+        acc, created = Account.objects.get_or_create(user=request.user)
+        acc.api_key = data.get('api_key')
+        acc.api_secret = data.get('api_secret')
+        acc.save()
+        return JsonResponse({'status': 'success'})
 
     elif action == 'panic_exit':
         side = data.get('side')
+        # Nexus engines is key ko monitor karke saare positions market exit kar denge
         r.set(f"algo:panic:{side}", "1", ex=60) 
-        return JsonResponse({'status': 'panic_signal_sent'})
+        return JsonResponse({'status': 'panic_sent'})
 
     elif action == 'manual_exit':
         symbol = data.get('symbol')
-        r.set(f"algo:manual_exit:{symbol}", "1", ex=20)
-        return JsonResponse({'status': 'exit_sent', 'symbol': symbol})
+        r.set(f"algo:manual_exit:{symbol}", "1", ex=30)
+        return JsonResponse({'status': 'exit_sent'})
 
     elif action == 'ban_symbol':
         symbol = data.get('symbol').upper()
+        BannedSymbol.objects.get_or_create(symbol=symbol, reason="Manual Ban via Dashboard")
         r.sadd("algo:banned_symbols", symbol)
-        return JsonResponse({'status': 'success', 'banned': symbol})
+        return JsonResponse({'status': 'success'})
 
-    return JsonResponse({'status': 'invalid_action'})
+    return JsonResponse({'status': 'error', 'message': 'Action not recognized'})
 
 @csrf_exempt
 @login_required
 def engine_settings_view(request, side):
-    """Engine specific settings (Matrix, RR, Trailing)"""
+    """10-Level Matrix aur Risk Config save/fetch karega"""
     r = get_redis_client()
-    redis_key = f"algo:settings:{side}"
+    acc = Account.objects.get(user=request.user)
     
     if request.method == 'POST':
         try:
             settings_data = json.loads(request.body)
-            r.set(redis_key, json.dumps(settings_data))
-            acc = Account.objects.get(user=request.user)
-            if side == 'bull': acc.bull_volume_settings_json = json.dumps(settings_data)
-            elif side == 'bear': acc.bear_volume_settings_json = json.dumps(settings_data)
+            # Sync to Redis for HFT Engines
+            r.set(f"algo:settings:{side}", json.dumps(settings_data))
+            
+            # Save to Django DB (JSONFields are direct objects)
+            if side == 'bull': acc.bull_volume_settings_json = settings_data
+            elif side == 'bear': acc.bear_volume_settings_json = settings_data
+            elif side == 'mom_bull': acc.mom_bull_volume_settings = settings_data
+            elif side == 'mom_bear': acc.mom_bear_volume_settings = settings_data
             acc.save()
             return JsonResponse({'status': 'success'})
         except Exception as e:
             return JsonResponse({'status': 'error', 'message': str(e)})
 
-    data = r.get(redis_key)
-    return JsonResponse(json.loads(data) if data else {})
+    # GET Request: Fetch existing settings
+    data = r.get(f"algo:settings:{side}")
+    if data:
+        return JsonResponse(json.loads(data))
+    
+    # Fallback to DB if Redis is empty
+    db_field = f"{side}_volume_settings_json" if 'mom' not in side else f"{side}_volume_settings"
+    return JsonResponse(getattr(acc, db_field) or {})
 
 @login_required
 def get_orders(request):
-    """Active aur Closed orders database se fetch karega"""
-    orders = {
-        'bull': list(CashBreakoutTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
-        'bear': list(CashBreakdownTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
-        'mom_bull': list(MomentumBullTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
-        'mom_bear': list(MomentumBearTrade.objects.filter(user=request.user).order_by('-id')[:10].values()),
-    }
-    return JsonResponse(orders)
+    """Active/Closed orders fetch karega dashboard tables ke liye"""
+    def fetch_trades(model):
+        return list(model.objects.filter(user=request.user).order_by('-id')[:10].values(
+            'symbol', 'entry_price', 'qty', 'pnl', 'status'
+        ))
+
+    return JsonResponse({
+        'bull': fetch_trades(CashBreakoutTrade),
+        'bear': fetch_trades(CashBreakdownTrade),
+        'mom_bull': fetch_trades(MomentumBullTrade),
+        'mom_bear': fetch_trades(MomentumBearTrade),
+    })
 
 @login_required
 def get_scanner_data(request):
-    """Nexus signals fetch karega"""
+    """Redis se live scanner signals uthayega"""
     r = get_redis_client()
     raw_signals = r.get("algo:scanner:signals")
     signals = json.loads(raw_signals) if raw_signals else []
     
     return JsonResponse({
-        'bull': [s for s in signals if s.get('type') == 'BULL'],
-        'bear': [s for s in signals if s.get('type') == 'BEAR'],
-        'mom_bull': [s for s in signals if s.get('type') == 'MOM_BULL'],
-        'mom_bear': [s for s in signals if s.get('type') == 'MOM_BEAR'],
+        'bull': [s for s in signals if 'BULL' in s.get('type', '') and 'MOM' not in s.get('type', '')],
+        'bear': [s for s in signals if 'BEAR' in s.get('type', '') and 'MOM' not in s.get('type', '')],
+        'mom_bull': [s for s in signals if 'MOM_BULL' in s.get('type', '')],
+        'mom_bear': [s for s in signals if 'MOM_BEAR' in s.get('type', '')],
     })
-
-@csrf_exempt
-@login_required
-def global_settings_view(request):
-    """Global configurations handler"""
-    return JsonResponse({"status": "global_config_active"})
