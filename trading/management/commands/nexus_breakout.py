@@ -313,59 +313,110 @@ class BreakoutNexus:
         stock['status'] = 'EXECUTING' # Ghost trigger protection
         asyncio.run_coroutine_threadsafe(self._async_kite_execute(token, side, price, stop_base, reason), self.loop)
 
-    async def _async_kite_execute(self, token, side, price, stop_base, reason):
-        """Kite API interact karega aur Slippage sync karega"""
-        stock = self.stocks[token]
-        config_label = 'bull' if (side == 'BUY' or 'BULL' in reason) else 'bear'
+    # async def _async_kite_execute(self, token, side, price, stop_base, reason):
+    #     """Kite API interact karega aur Slippage sync karega"""
+    #     stock = self.stocks[token]
+    #     config_label = 'bull' if (side == 'BUY' or 'BULL' in reason) else 'bear'
     
+    #     try:
+    #         # 1. LUA Limit check (Atomic Counter in Redis)
+    #         if side in ['BUY', 'SELL']:
+    #             if self.r.eval(LUA_INC_LIMIT, 1, f"hft:count:{self.user_id}:{config_label}", self.config[config_label]['max_total']) == -1:
+    #                 logger.warning(f"LIMIT BLOCKED: {config_label} limit reached for user {self.user_id}")
+    #                 stock['status'] = 'PENDING'; return
+
+    #         # 2. Risk Calculation based on tiers
+    #         risk_tier = self.config[config_label]['risk_tiers'][min(stock['stock_trades'], 2)]
+    #         risk_amt = abs(price - stop_base)
+    #         qty = max(1, int(floor(risk_tier / risk_amt))) if risk_amt > 0 else 1
+
+    #         # 3. Market MIS Order Placement
+    #         oid = self.kite.place_order(
+    #             tradingsymbol=stock['symbol'], exchange='NSE', transaction_type=side,
+    #             quantity=qty, order_type='MARKET', product='MIS', variety='regular'
+    #         )
+    #         logger.info(f"API ORDER: {stock['symbol']} {side} Fire! OID: {oid}")
+
+    #         # 4. SLIPPAGE SYNC: Actual Demat Average Price fetch karna
+    #         actual_px = price
+    #         await asyncio.sleep(0.2)
+    #         try:
+    #             hist = self.kite.order_history(oid)
+    #             if hist[-1]['status'] == 'COMPLETE':
+    #                 actual_px = float(hist[-1]['average_price'])
+    #         except: pass 
+            
+    #         # 5. Position Memory management
+    #         if side in ['BUY', 'SELL']:
+    #             stock['status'] = 'OPEN'
+    #             stock['stock_trades'] += 1
+    #             risk = abs(actual_px - stop_base)
+    #             self.open_trades[token] = {
+    #                 'side': side, 'entry_px': actual_px, 'sl': stop_base, 'qty': qty,
+    #                 'target': actual_px + (risk * self.config[config_label]['rr']) if side == 'BUY' else actual_px - (risk * self.config[label]['rr']),
+    #                 'step': risk * self.config[config_label]['tsl'], 'oid': oid
+    #             }
+    #             logger.info(f"HFT SUCCESS: {stock['symbol']} Position Active @ {actual_px}")
+    #         else:
+    #             stock['status'] = 'CLOSED'
+    #             self.open_trades.pop(token, None)
+    #             logger.info(f"HFT SUCCESS: {stock['symbol']} Position Closed @ {actual_px}")
+
+    #     except Exception as e:
+    #         logger.error(f"KITE API ERROR: {e}")
+    #         stock['status'] = 'PENDING'
+    async def _async_kite_execute(self, token, side, price, stop_base, reason):
+        stock = self.stocks[token]
+        config_label = 'bull' if ('BULL' in reason) else 'bear'
+        
         try:
-            # 1. LUA Limit check (Atomic Counter in Redis)
-            if side in ['BUY', 'SELL']:
-                if self.r.eval(LUA_INC_LIMIT, 1, f"hft:count:{self.user_id}:{config_label}", self.config[config_label]['max_total']) == -1:
-                    logger.warning(f"LIMIT BLOCKED: {config_label} limit reached for user {self.user_id}")
+            # --- FIXED QUANTITY LOGIC ---
+            if "EXIT" in reason:
+                if token not in self.open_trades:
+                    logger.error(f"EXIT FAIL: {stock['symbol']} memory missing.")
                     stock['status'] = 'PENDING'; return
+                # RAM memory se wahi exact quantity uthao jo entry ke waqt li thi
+                qty = self.open_trades[token]['qty']
+                side = 'SELL' if self.open_trades[token]['side'] == 'BUY' else 'BUY'
+            else:
+                # ENTRY Quantity calculation
+                if self.r.eval(LUA_INC_LIMIT, 1, f"hft:count:{self.user_id}:{config_label}", self.config[config_label]['max_total']) == -1:
+                    logger.warning(f"LIMIT BLOCKED: {config_label}"); stock['status'] = 'PENDING'; return
+                risk_tier = self.config[config_label]['risk_tiers'][min(stock['stock_trades'], 2)]
+                risk_val = abs(price - stop_base)
+                qty = max(1, int(floor(risk_tier / risk_val))) if risk_val > 0 else 1
 
-            # 2. Risk Calculation based on tiers
-            risk_tier = self.config[config_label]['risk_tiers'][min(stock['stock_trades'], 2)]
-            risk_amt = abs(price - stop_base)
-            qty = max(1, int(floor(risk_tier / risk_amt))) if risk_amt > 0 else 1
+            # Place Kite Order
+            oid = self.kite.place_order(tradingsymbol=stock['symbol'], exchange='NSE', transaction_type=side, quantity=qty, order_type='MARKET', product='MIS', variety='regular')
+            logger.info(f"API FIRE: {stock['symbol']} {side} x {qty} | OID: {oid}")
 
-            # 3. Market MIS Order Placement
-            oid = self.kite.place_order(
-                tradingsymbol=stock['symbol'], exchange='NSE', transaction_type=side,
-                quantity=qty, order_type='MARKET', product='MIS', variety='regular'
-            )
-            logger.info(f"API ORDER: {stock['symbol']} {side} Fire! OID: {oid}")
-
-            # 4. SLIPPAGE SYNC: Actual Demat Average Price fetch karna
+            # Slippage & Persistence
             actual_px = price
-            await asyncio.sleep(0.2)
+            await asyncio.sleep(0.3)
             try:
                 hist = self.kite.order_history(oid)
-                if hist[-1]['status'] == 'COMPLETE':
-                    actual_px = float(hist[-1]['average_price'])
-            except: pass 
+                if hist[-1]['status'] == 'COMPLETE': actual_px = float(hist[-1]['average_price'])
+            except: pass
             
-            # 5. Position Memory management
-            if side in ['BUY', 'SELL']:
-                stock['status'] = 'OPEN'
-                stock['stock_trades'] += 1
+            # --- DATABASE SYNC PUSH ---
+            trade_payload = {'symbol': stock['symbol'], 'side': side, 'price': actual_px, 'qty': qty, 'oid': oid, 'reason': reason}
+            await self.db_queue.put(trade_payload) # Background mein Postgres update hoga
+
+            if "EXIT" not in reason:
+                stock['status'] = 'OPEN'; stock['stock_trades'] += 1
                 risk = abs(actual_px - stop_base)
                 self.open_trades[token] = {
                     'side': side, 'entry_px': actual_px, 'sl': stop_base, 'qty': qty,
-                    'target': actual_px + (risk * self.config[config_label]['rr']) if side == 'BUY' else actual_px - (risk * self.config[label]['rr']),
+                    'target': actual_px + (risk * self.config[config_label]['rr']) if side == 'BUY' else actual_px - (risk * self.config[config_label]['rr']),
                     'step': risk * self.config[config_label]['tsl'], 'oid': oid
                 }
-                logger.info(f"HFT SUCCESS: {stock['symbol']} Position Active @ {actual_px}")
+                logger.info(f"OPEN SUCCESS: {stock['symbol']} @ {actual_px} (Target: {self.open_trades[token]['target']})")
             else:
-                stock['status'] = 'CLOSED'
-                self.open_trades.pop(token, None)
-                logger.info(f"HFT SUCCESS: {stock['symbol']} Position Closed @ {actual_px}")
+                stock['status'] = 'CLOSED'; self.open_trades.pop(token, None)
+                logger.info(f"CLOSED SUCCESS: {stock['symbol']} @ {actual_px}")
 
         except Exception as e:
-            logger.error(f"KITE API ERROR: {e}")
-            stock['status'] = 'PENDING'
-
+            logger.error(f"API ERROR: {e}"); stock['status'] = 'PENDING'
     async def settings_poller(self):
         """Dashboard parameters ko refresh karne wala background worker"""
         while True:
