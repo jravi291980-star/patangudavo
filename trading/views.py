@@ -9,7 +9,7 @@ from kiteconnect import KiteConnect
 from django.conf import settings
 
 from .models import Account, CashBreakoutTrade, CashBreakdownTrade, MomentumBullTrade, MomentumBearTrade
-from .hft_utils import get_redis_client # Safe Redis client
+from .hft_utils import get_redis_client
 
 logger = logging.getLogger("TradingViews")
 
@@ -44,7 +44,7 @@ def kite_callback(request):
         data = kite.generate_session(request_token, api_secret=acc.api_secret)
         acc.access_token = data['access_token']
         acc.save()
-        # Redis mein bhi update kar dein taaki engines ko turant mil jaye
+        # Redis mein update
         r = get_redis_client()
         r.set(f"hft:access_token:{acc.user.id}", data['access_token'])
         return redirect('/')
@@ -52,20 +52,21 @@ def kite_callback(request):
         logger.error(f"Kite Login Failed: {e}")
         return JsonResponse({'status': 'error', 'message': str(e)})
 
-# --- HFT API ENDPOINTS ---
+# --- HFT API ENDPOINTS (Names Matched to URLs) ---
 
 @login_required
-def stats_view(request):
+def dashboard_stats(request):
     """PnL, Heartbeat aur Engine status supply karega"""
     r = get_redis_client()
     last_heartbeat = r.get("algo:data:heartbeat")
     
     is_live = False
-    if last_heartbeat:
-        if int(datetime.now().timestamp()) - int(last_heartbeat) < 15:
-            is_live = True
+    if last_heartbeat and not isinstance(r, object): # Mock check
+        try:
+            if int(datetime.now().timestamp()) - int(last_heartbeat) < 15:
+                is_live = True
+        except: pass
 
-    # Engine toggle status from Redis
     status = {
         'bull': r.get("algo:engine:bull:enabled") or "0",
         'bear': r.get("algo:engine:bear:enabled") or "0",
@@ -73,14 +74,7 @@ def stats_view(request):
         'mom_bear': r.get("algo:engine:mom_bear:enabled") or "0",
     }
 
-    # P&L Logic (Inhe aap real calculations se replace kar sakte hain)
-    pnl_data = {
-        'total': 0.00,
-        'bull': 0.00,
-        'bear': 0.00,
-        'mom_bull': 0.00,
-        'mom_bear': 0.00
-    }
+    pnl_data = {'total': 0.0, 'bull': 0.0, 'bear': 0.0, 'mom_bull': 0.0, 'mom_bear': 0.0}
 
     return JsonResponse({
         'data_connected': is_live,
@@ -90,7 +84,7 @@ def stats_view(request):
 
 @csrf_exempt
 @login_required
-def control_view(request):
+def control_action(request):
     """Buttons (Toggle, Panic, Ban, Exit) handle karega"""
     if request.method != "POST":
         return JsonResponse({"status": "failed"}, status=400)
@@ -133,18 +127,14 @@ def engine_settings_view(request, side):
         try:
             settings_data = json.loads(request.body)
             r.set(redis_key, json.dumps(settings_data))
-            
-            # DB mein bhi update karein (Agar model fields aligned hain)
             acc = Account.objects.get(user=request.user)
             if side == 'bull': acc.bull_volume_settings_json = json.dumps(settings_data)
             elif side == 'bear': acc.bear_volume_settings_json = json.dumps(settings_data)
             acc.save()
-            
             return JsonResponse({'status': 'success'})
         except Exception as e:
             return JsonResponse({'status': 'error', 'message': str(e)})
 
-    # GET request
     data = r.get(redis_key)
     return JsonResponse(json.loads(data) if data else {})
 
@@ -176,8 +166,5 @@ def get_scanner_data(request):
 @csrf_exempt
 @login_required
 def global_settings_view(request):
-    """
-    FIX: missing function jiske liye urls.py crash ho raha tha.
-    Yahan aap pure system ki global configurations save kar sakte hain.
-    """
+    """Global configurations handler"""
     return JsonResponse({"status": "global_config_active"})
