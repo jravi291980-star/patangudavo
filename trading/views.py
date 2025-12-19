@@ -19,7 +19,7 @@ logger = logging.getLogger("TradingViews")
 def home(request):
     """Main Dashboard render karega"""
     account = Account.objects.first()
-    return render(request, 'dashboard.html', {'account': account})
+    return render(request, 'templates/trading/dashboard.html', {'account': account})
 
 # --- ZERODHA / KITE AUTHENTICATION ---
 
