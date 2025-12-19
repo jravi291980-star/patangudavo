@@ -29,6 +29,8 @@ class Account(models.Model):
     bear_volume_settings_json = models.JSONField(default=list, blank=True)
     mom_bull_volume_settings = models.JSONField(default=list, blank=True)
     mom_bear_volume_settings = models.JSONField(default=list, blank=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
 
     def __str__(self):
         return f"{self.user.username} ka Kite Account"
