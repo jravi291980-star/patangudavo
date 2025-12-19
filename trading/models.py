@@ -10,32 +10,31 @@ class Account(models.Model):
     # API Credentials
     api_key = models.CharField(max_length=100)
     api_secret = models.CharField(max_length=100)
-    access_token = models.CharField(max_length=255, blank=True, null=True)
+    access_token = models.CharField(max_length=500, blank=True, null=True)
     
     # Global Limits
-    breakout_max_trades = models.IntegerField(default=5) # Cash strategies ke liye
+    breakout_max_trades = models.IntegerField(default=5) 
     breakdown_max_trades = models.IntegerField(default=5)
-    momentum_max_trades = models.IntegerField(default=3) # Momentum ke liye
+    momentum_max_trades = models.IntegerField(default=3) 
     
-    # Time Ranges (MIS trading ke liye)
+    # Time Ranges
     breakout_start_time = models.TimeField(default="09:15")
     breakout_end_time = models.TimeField(default="15:15")
     breakdown_start_time = models.TimeField(default="09:15")
     breakdown_end_time = models.TimeField(default="15:15")
     
-    # Advanced JSON Settings (Websockets aur Volume filters ke liye)
-    # Isme 10-level volume filters aur tiered risk data save hota hai
+    # Advanced JSON Settings (10-level volume filters aur tiered risk data)
     bull_volume_settings_json = models.JSONField(default=list, blank=True)
     bear_volume_settings_json = models.JSONField(default=list, blank=True)
     mom_bull_volume_settings = models.JSONField(default=list, blank=True)
     mom_bear_volume_settings = models.JSONField(default=list, blank=True)
 
     def __str__(self):
-        return f"{self.user.username} ka Account"
+        return f"{self.user.username} ka Kite Account"
 
 class BaseTrade(models.Model):
     """
-    Ek base class taaki code baar-baar na likhna pade.
+    Abstract Base Model for HFT Sync
     """
     STATUS_CHOICES = [
         ('OPEN', 'Open'),
@@ -43,18 +42,19 @@ class BaseTrade(models.Model):
         ('CANCELLED', 'Cancelled'),
     ]
     
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
     symbol = models.CharField(max_length=20)
     entry_price = models.FloatField()
     exit_price = models.FloatField(null=True, blank=True)
-    quantity = models.IntegerField()
+    qty = models.IntegerField() # Fixed name for Admin/Nexus compatibility
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='OPEN')
     
-    # HFT Sync Fields
-    order_id = models.CharField(max_length=50, blank=True, null=True) # Kite order ID
-    initial_risk = models.FloatField(default=0.0) # Entry - StopLoss (at trigger time)
-    step_size = models.FloatField(default=0.0)    # initial_risk * trailing_ratio
-    sl_price = models.FloatField()                # Current Stop Loss in market
-    target_price = models.FloatField()            # Current Target
+    # HFT Sync Fields (Nexus RAM monitoring ke liye zaruri)
+    order_id = models.CharField(max_length=50, blank=True, null=True) 
+    initial_risk = models.FloatField(default=0.0) 
+    step_size = models.FloatField(default=0.0)    
+    sl_price = models.FloatField()                
+    target_price = models.FloatField()            
     
     pnl = models.FloatField(default=0.0)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -64,19 +64,15 @@ class BaseTrade(models.Model):
         abstract = True
 
 class CashBreakoutTrade(BaseTrade):
-    """Cash Bull Strategy Trades"""
     pass
 
 class CashBreakdownTrade(BaseTrade):
-    """Cash Bear Strategy Trades"""
     pass
 
 class MomentumBullTrade(BaseTrade):
-    """Momentum Bull Strategy Trades"""
     pass
 
 class MomentumBearTrade(BaseTrade):
-    """Momentum Bear Strategy Trades"""
     pass
 
 class BannedSymbol(models.Model):
