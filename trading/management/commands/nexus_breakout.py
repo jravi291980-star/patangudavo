@@ -316,17 +316,17 @@ class BreakoutNexus:
     async def _async_kite_execute(self, token, side, price, stop_base, reason):
         """Kite API interact karega aur Slippage sync karega"""
         stock = self.stocks[token]
-        label = side.lower() if side in ['BUY', 'SELL'] else ('bull' if 'BULL' in reason else 'bear')
-        
+        config_label = 'bull' if (side == 'BUY' or 'BULL' in reason) else 'bear'
+    
         try:
             # 1. LUA Limit check (Atomic Counter in Redis)
             if side in ['BUY', 'SELL']:
-                if self.r.eval(LUA_INC_LIMIT, 1, f"hft:count:{self.user_id}:{label}", self.config[label]['max_total']) == -1:
-                    logger.warning(f"LIMIT BLOCKED: {label} limit reached for user {self.user_id}")
+                if self.r.eval(LUA_INC_LIMIT, 1, f"hft:count:{self.user_id}:{config_label}", self.config[config_label]['max_total']) == -1:
+                    logger.warning(f"LIMIT BLOCKED: {config_label} limit reached for user {self.user_id}")
                     stock['status'] = 'PENDING'; return
 
             # 2. Risk Calculation based on tiers
-            risk_tier = self.config[label]['risk_tiers'][min(stock['stock_trades'], 2)]
+            risk_tier = self.config[config_label]['risk_tiers'][min(stock['stock_trades'], 2)]
             risk_amt = abs(price - stop_base)
             qty = max(1, int(floor(risk_tier / risk_amt))) if risk_amt > 0 else 1
 
@@ -353,8 +353,8 @@ class BreakoutNexus:
                 risk = abs(actual_px - stop_base)
                 self.open_trades[token] = {
                     'side': side, 'entry_px': actual_px, 'sl': stop_base, 'qty': qty,
-                    'target': actual_px + (risk * self.config[label]['rr']) if side == 'BUY' else actual_px - (risk * self.config[label]['rr']),
-                    'step': risk * self.config[label]['tsl'], 'oid': oid
+                    'target': actual_px + (risk * self.config[config_label]['rr']) if side == 'BUY' else actual_px - (risk * self.config[label]['rr']),
+                    'step': risk * self.config[config_label]['tsl'], 'oid': oid
                 }
                 logger.info(f"HFT SUCCESS: {stock['symbol']} Position Active @ {actual_px}")
             else:
