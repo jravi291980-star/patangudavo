@@ -3,481 +3,230 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>KiteMaster Algo Dashboard | HFT Nexus</title>
-    
-    <!-- Tailwind CSS -->
+    <title>KiteMaster HFT | Dashboard</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <!-- Lucide Icons -->
-    <script src="https://unpkg.com/lucide@latest"></script>
-    <!-- Axios for API -->
-    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
-
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
     <style>
-        html, body {
-            background-color: #030712 !important;
-            color: #f3f4f6;
-            font-family: ui-sans-serif, system-ui;
-            margin: 0; padding: 0; height: 100%;
-        }
-        .custom-scrollbar::-webkit-scrollbar { width: 4px; }
-        .custom-scrollbar::-webkit-scrollbar-track { background: #111827; }
-        .custom-scrollbar::-webkit-scrollbar-thumb { background: #374151; border-radius: 10px; }
-        .hidden { display: none !important; }
-        .pnl-plus { color: #10b981; }
-        .pnl-minus { color: #f43f5e; }
-        .scanner-box { height: 180px; font-size: 10px; }
+        .glass { background: rgba(255, 255, 255, 0.05); backdrop-filter: blur(10px); }
+        body { background-color: #0f172a; color: white; }
+        .switch { position: relative; display: inline-block; width: 50px; height: 24px; }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #334155; transition: .4s; border-radius: 24px; }
+        .slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: white; transition: .4s; border-radius: 50%; }
+        input:checked + .slider { background-color: #22c55e; }
+        input:checked + .slider:before { transform: translateX(26px); }
+        .modal { display: none; position: fixed; z-index: 100; left: 0; top: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); }
     </style>
 </head>
-<body class="min-h-screen flex flex-col bg-gray-950">
+<body class="p-4 md:p-8">
 
-    <!-- HEADER -->
-    <header class="bg-gray-900 border-b border-gray-800 px-4 py-2 shadow-xl flex justify-between items-center sticky top-0 z-30 w-full">
-        <div class="flex items-center gap-3">
-           <div class="w-6 h-6 bg-blue-700 rounded flex items-center justify-center font-bold text-xs text-white">KM</div>
-           <h1 class="text-xl font-bold tracking-tight text-white">Kite <span class="text-blue-500 font-light">Master</span></h1>
+    <!-- Header -->
+    <div class="flex flex-col md:flex-row justify-between items-center mb-8 gap-4">
+        <div>
+            <h1 class="text-3xl font-bold text-green-400"><i class="fas fa-bolt"></i> KiteMaster HFT</h1>
+            <p class="text-slate-400">Welcome, {{ user.username }} | <span id="heartbeat" class="text-red-500">● Offline</span></p>
         </div>
-        
-        <div class="flex items-center gap-6">
-            <!-- Sentiment Tracker -->
-            <div class="flex items-center gap-3 px-3 py-1 rounded bg-gray-800/50 border border-gray-700">
-                <div class="flex items-center gap-1.5">
-                    <i data-lucide="activity" class="w-4 h-4 text-emerald-400"></i>
-                    <span id="sentiment-pct" class="text-sm font-black text-emerald-400">0%</span>
-                </div>
-                <div class="h-4 w-px bg-gray-700"></div>
-                <div class="text-[10px] font-bold text-gray-400 flex gap-3">
-                    <span>BULL: <span class="text-emerald-400" id="sent-bull">0</span></span>
-                    <span>BEAR: <span class="text-rose-400" id="sent-bear">0</span></span>
-                </div>
-            </div>
-
-            <!-- Global P&L -->
-            <div class="bg-gray-800 px-3 py-1 rounded border border-gray-700 flex items-center gap-3">
-                <span class="text-[10px] font-bold text-gray-400 uppercase tracking-widest">Total P&L:</span>
-                <span id="total-pnl" class="text-lg font-black text-white">₹ 0.00</span>
-            </div>
-
-            <!-- Heartbeat -->
-            <div class="flex items-center gap-2 px-3 py-1 bg-gray-800 rounded border border-gray-700">
-                <div id="data-dot" class="w-2.5 h-2.5 rounded-full bg-red-500"></div>
-                <span id="data-text" class="text-[10px] font-black uppercase text-red-500">Offline</span>
-            </div>
-            
-            <button onclick="openApiModal()" class="bg-blue-600 hover:bg-blue-700 text-white px-3 py-1 rounded text-[10px] font-bold uppercase transition-all">
-                <i data-lucide="key" class="w-3 h-3 inline mr-1"></i> API Creds
+        <div class="flex gap-3">
+            <a href="/kite/login/" class="bg-blue-600 hover:bg-blue-700 px-6 py-2 rounded-lg font-bold transition">
+                <i class="fas fa-key"></i> Kite Login
+            </a>
+            <button onclick="panicAll()" class="bg-red-600 hover:bg-red-700 px-6 py-2 rounded-lg font-bold transition">
+                <i class="fas fa-skull"></i> PANIC EXIT
             </button>
-        </div>
-    </header>
-
-    <main class="flex-1 p-4 grid grid-cols-12 gap-4">
-        
-        <!-- SIDEBAR: Controls & Blacklist (3 Cols) -->
-        <aside class="col-span-3 space-y-4">
-            <!-- Engine Master Controls -->
-            <div class="bg-gray-900 p-4 rounded-xl border border-gray-800 shadow-lg">
-                <h3 class="text-xs font-bold text-gray-500 uppercase tracking-widest mb-4 border-b border-gray-800 pb-2">Nexus Engine Control</h3>
-                
-                <div class="space-y-4">
-                    <!-- 1. Cash Bull -->
-                    <div class="flex items-center justify-between">
-                        <span class="text-xs font-bold text-emerald-400">CASH BULL</span>
-                        <div class="flex items-center gap-2">
-                            <button onclick="toggleEngine('bull')" id="btn-bull-toggle" class="w-10 h-5 rounded-full bg-gray-700 relative transition-all">
-                                <div id="dot-bull-toggle" class="w-4 h-4 bg-white rounded-full absolute top-0.5 left-0.5 transition-all"></div>
-                            </button>
-                            <button onclick="openSettings('bull')" class="text-[10px] bg-gray-800 p-1 rounded hover:bg-gray-700"><i data-lucide="settings" class="w-3 h-3"></i></button>
-                        </div>
-                    </div>
-                    <!-- 2. Cash Bear -->
-                    <div class="flex items-center justify-between">
-                        <span class="text-xs font-bold text-rose-400">CASH BEAR</span>
-                        <div class="flex items-center gap-2">
-                            <button onclick="toggleEngine('bear')" id="btn-bear-toggle" class="w-10 h-5 rounded-full bg-gray-700 relative transition-all">
-                                <div id="dot-bear-toggle" class="w-4 h-4 bg-white rounded-full absolute top-0.5 left-0.5 transition-all"></div>
-                            </button>
-                            <button onclick="openSettings('bear')" class="text-[10px] bg-gray-800 p-1 rounded hover:bg-gray-700"><i data-lucide="settings" class="w-3 h-3"></i></button>
-                        </div>
-                    </div>
-                    <!-- 3. Mom Bull -->
-                    <div class="flex items-center justify-between">
-                        <span class="text-xs font-bold text-blue-400">MOM BULL</span>
-                        <div class="flex items-center gap-2">
-                            <button onclick="toggleEngine('mom_bull')" id="btn-mom_bull-toggle" class="w-10 h-5 rounded-full bg-gray-700 relative transition-all">
-                                <div id="dot-mom_bull-toggle" class="w-4 h-4 bg-white rounded-full absolute top-0.5 left-0.5 transition-all"></div>
-                            </button>
-                            <button onclick="openSettings('mom_bull')" class="text-[10px] bg-gray-800 p-1 rounded hover:bg-gray-700"><i data-lucide="settings" class="w-3 h-3"></i></button>
-                        </div>
-                    </div>
-                    <!-- 4. Mom Bear -->
-                    <div class="flex items-center justify-between">
-                        <span class="text-xs font-bold text-orange-400">MOM BEAR</span>
-                        <div class="flex items-center gap-2">
-                            <button onclick="toggleEngine('mom_bear')" id="btn-mom_bear-toggle" class="w-10 h-5 rounded-full bg-gray-700 relative transition-all">
-                                <div id="dot-mom_bear-toggle" class="w-4 h-4 bg-white rounded-full absolute top-0.5 left-0.5 transition-all"></div>
-                            </button>
-                            <button onclick="openSettings('mom_bear')" class="text-[10px] bg-gray-800 p-1 rounded hover:bg-gray-700"><i data-lucide="settings" class="w-3 h-3"></i></button>
-                        </div>
-                    </div>
-                </div>
-
-                <button onclick="panicExit('all')" class="w-full mt-6 bg-red-600 hover:bg-red-700 text-white font-black py-2 rounded shadow-lg text-xs uppercase tracking-tighter">
-                    PANIC EXIT ALL POSITIONS
-                </button>
-            </div>
-
-            <!-- Blacklist -->
-            <div class="bg-gray-900 p-4 rounded-xl border border-gray-800">
-                <h3 class="text-xs font-bold text-gray-500 uppercase tracking-widest mb-3">Ban Symbols</h3>
-                <div class="flex gap-2">
-                    <input type="text" id="ban-input" class="flex-1 bg-gray-950 border border-gray-700 rounded px-2 py-1 text-xs focus:border-blue-500 outline-none" placeholder="SYMBOL">
-                    <button onclick="banSymbol()" class="bg-gray-700 px-3 rounded text-[10px] font-bold">BAN</button>
-                </div>
-                <div id="ban-list" class="mt-3 flex flex-wrap gap-1"></div>
-            </div>
-        </aside>
-
-        <!-- MAIN AREA: Tables & Scanners (9 Cols) -->
-        <div class="col-span-9 space-y-4">
-            <!-- Active Trades Table -->
-            <div class="bg-gray-900 rounded-xl border border-gray-800 shadow-2xl overflow-hidden">
-                <div class="bg-gray-800/50 px-4 py-2 border-b border-gray-800 flex justify-between items-center">
-                    <span class="text-xs font-bold uppercase tracking-widest text-gray-400">Active HFT Positions</span>
-                    <span id="active-count" class="bg-blue-600 text-[10px] px-2 py-0.5 rounded-full font-bold">0 OPEN</span>
-                </div>
-                <div class="max-h-[350px] overflow-y-auto custom-scrollbar">
-                    <table class="w-full text-left text-xs border-collapse">
-                        <thead class="sticky top-0 bg-gray-900 text-gray-500 font-bold uppercase text-[10px]">
-                            <tr>
-                                <th class="px-4 py-2 border-b border-gray-800">Symbol</th>
-                                <th class="px-4 py-2 border-b border-gray-800">Type</th>
-                                <th class="px-4 py-2 border-b border-gray-800">Entry</th>
-                                <th class="px-4 py-2 border-b border-gray-800">LTP</th>
-                                <th class="px-4 py-2 border-b border-gray-800">SL (Trail)</th>
-                                <th class="px-4 py-2 border-b border-gray-800">Target</th>
-                                <th class="px-4 py-2 border-b border-gray-800">P&L</th>
-                                <th class="px-4 py-2 border-b border-gray-800">Action</th>
-                            </tr>
-                        </thead>
-                        <tbody id="trades-tbody" class="divide-y divide-gray-800">
-                            <!-- Rows via JS -->
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-
-            <!-- Scanners Grid -->
-            <div class="grid grid-cols-4 gap-4">
-                <!-- Bull Scanner -->
-                <div class="bg-gray-900 rounded-xl border-t-2 border-emerald-500 p-2 shadow-lg">
-                    <h4 class="text-[10px] font-bold text-emerald-500 mb-2 uppercase flex items-center gap-1"><i data-lucide="search" class="w-3 h-3"></i> Bull Scanner</h4>
-                    <div id="scanner-bull" class="scanner-box overflow-y-auto custom-scrollbar space-y-1"></div>
-                </div>
-                <!-- Bear Scanner -->
-                <div class="bg-gray-900 rounded-xl border-t-2 border-rose-500 p-2 shadow-lg">
-                    <h4 class="text-[10px] font-bold text-rose-500 mb-2 uppercase flex items-center gap-1"><i data-lucide="search" class="w-3 h-3"></i> Bear Scanner</h4>
-                    <div id="scanner-bear" class="scanner-box overflow-y-auto custom-scrollbar space-y-1"></div>
-                </div>
-                <!-- Mom Bull Scanner -->
-                <div class="bg-gray-900 rounded-xl border-t-2 border-blue-500 p-2 shadow-lg">
-                    <h4 class="text-[10px] font-bold text-blue-500 mb-2 uppercase flex items-center gap-1"><i data-lucide="zap" class="w-3 h-3"></i> Mom Bull</h4>
-                    <div id="scanner-mom_bull" class="scanner-box overflow-y-auto custom-scrollbar space-y-1"></div>
-                </div>
-                <!-- Mom Bear Scanner -->
-                <div class="bg-gray-900 rounded-xl border-t-2 border-orange-500 p-2 shadow-lg">
-                    <h4 class="text-[10px] font-bold text-orange-500 mb-2 uppercase flex items-center gap-1"><i data-lucide="zap-off" class="w-3 h-3"></i> Mom Bear</h4>
-                    <div id="scanner-mom_bear" class="scanner-box overflow-y-auto custom-scrollbar space-y-1"></div>
-                </div>
-            </div>
-        </div>
-    </main>
-
-    <!-- SETTINGS MODAL (10-LEVEL VOLUME) -->
-    <div id="settings-modal" class="fixed inset-0 bg-black/90 flex items-center justify-center z-50 backdrop-blur-sm hidden">
-        <div class="bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl w-[45rem] max-h-[90vh] flex flex-col overflow-hidden" id="modal-container">
-            <div class="p-4 border-b border-gray-800 flex justify-between items-center bg-gray-800/30">
-                <h3 id="modal-title" class="text-sm font-black uppercase tracking-widest text-blue-400 flex items-center gap-2">Config</h3>
-                <button onclick="closeSettings()" class="text-gray-500 hover:text-white"><i data-lucide="x" class="w-5 h-5"></i></button>
-            </div>
-            
-            <div class="flex-1 overflow-y-auto p-4 custom-scrollbar space-y-6">
-                <!-- Strategy Basics -->
-                <div class="grid grid-cols-3 gap-4">
-                    <div class="bg-gray-950 p-3 rounded-lg border border-gray-800">
-                        <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Risk : Reward</label>
-                        <input id="inp-rr" class="w-full bg-transparent border-b border-gray-700 focus:border-blue-500 outline-none text-sm font-bold text-white">
-                    </div>
-                    <div class="bg-gray-950 p-3 rounded-lg border border-gray-800">
-                        <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Trail Step Ratio</label>
-                        <input id="inp-tsl" class="w-full bg-transparent border-b border-gray-700 focus:border-blue-500 outline-none text-sm font-bold text-white">
-                    </div>
-                    <div class="bg-gray-950 p-3 rounded-lg border border-gray-800">
-                        <label class="block text-[10px] font-bold text-gray-500 uppercase mb-1">Total Max Trades</label>
-                        <input id="inp-max-trades" type="number" class="w-full bg-transparent border-b border-gray-700 focus:border-blue-500 outline-none text-sm font-bold text-white">
-                    </div>
-                </div>
-
-                <!-- Cash Specific Risk Tier -->
-                <div id="cash-risk-box" class="grid grid-cols-4 gap-4 p-3 bg-blue-900/10 rounded-lg border border-blue-900/30">
-                    <div><label class="block text-[9px] font-bold text-blue-400">STOCK LIMIT</label><input id="inp-tps" type="number" class="w-full bg-transparent border-b border-blue-800 text-xs text-white outline-none"></div>
-                    <div><label class="block text-[9px] font-bold text-gray-500">RISK T1</label><input id="inp-r1" type="number" class="w-full bg-transparent border-b border-gray-700 text-xs text-white outline-none"></div>
-                    <div><label class="block text-[9px] font-bold text-gray-500">RISK T2</label><input id="inp-r2" type="number" class="w-full bg-transparent border-b border-gray-700 text-xs text-white outline-none"></div>
-                    <div><label class="block text-[9px] font-bold text-gray-500">RISK T3</label><input id="inp-r3" type="number" class="w-full bg-transparent border-b border-gray-700 text-xs text-white outline-none"></div>
-                </div>
-
-                <!-- 10-Level Volume SMA Matrix -->
-                <div>
-                    <h4 class="text-[10px] font-black text-gray-500 uppercase mb-3 flex items-center gap-2"><i data-lucide="bar-chart" class="w-3 h-3"></i> Volume SMA Criteria Matrix</h4>
-                    <div id="vol-matrix-container" class="space-y-1">
-                        <!-- 10 Rows injected here -->
-                    </div>
-                </div>
-            </div>
-
-            <div class="p-4 border-t border-gray-800 bg-gray-800/20">
-                <button onclick="saveSettings()" class="w-full bg-emerald-600 hover:bg-emerald-700 text-white font-black py-3 rounded-xl shadow-2xl transition-all uppercase tracking-widest text-xs">
-                    Apply Config to Nexus RAM
-                </button>
-            </div>
         </div>
     </div>
 
-    <!-- API Modal -->
-    <div id="api-modal" class="fixed inset-0 bg-black/90 flex items-center justify-center z-50 backdrop-blur-sm hidden">
-        <div class="bg-gray-900 border border-gray-700 rounded-xl p-6 w-96 shadow-2xl">
-            <h3 class="text-sm font-black uppercase text-white mb-6 border-b border-gray-800 pb-2">API Credentials</h3>
-            <div class="space-y-4">
-                <input id="api-key" type="text" placeholder="API Key" class="w-full bg-gray-950 border border-gray-700 rounded px-3 py-2 text-xs text-white outline-none focus:border-blue-500">
-                <input id="api-secret" type="password" placeholder="API Secret" class="w-full bg-gray-950 border border-gray-700 rounded px-3 py-2 text-xs text-white outline-none focus:border-blue-500">
-                <button onclick="saveAPI()" class="w-full bg-blue-600 py-2 rounded font-bold text-xs">SAVE CREDENTIALS</button>
-                <button onclick="window.location.href='/kite_login/'" class="w-full bg-emerald-600 py-2 rounded font-bold text-xs mt-2">LOGIN TO KITE</button>
+    <!-- Stats Grid -->
+    <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-8">
+        <div class="glass p-6 rounded-2xl border border-slate-700">
+            <p class="text-slate-400 text-sm">Total MTM</p>
+            <h2 id="pnl-total" class="text-3xl font-bold mt-1 text-white">₹ 0.00</h2>
+        </div>
+        <!-- Engines Control Cards -->
+        <div class="grid grid-cols-1 md:grid-cols-4 gap-4 col-span-4">
+            <script>
+                const engines = [
+                    { id: 'bull', name: 'Cash Bull', color: 'green' },
+                    { id: 'bear', name: 'Cash Bear', color: 'red' },
+                    { id: 'mom_bull', name: 'Mom Bull', color: 'blue' },
+                    { id: 'mom_bear', name: 'Mom Bear', color: 'orange' }
+                ];
+            </script>
+            
+            <!-- Cards Rendered via JS for consistency -->
+            <div id="engine-cards" class="contents"></div>
+        </div>
+    </div>
+
+    <!-- Settings Modal -->
+    <div id="settingsModal" class="modal flex items-center justify-center">
+        <div class="bg-slate-900 w-full max-w-4xl p-6 rounded-2xl border border-slate-700 max-h-[90vh] overflow-y-auto">
+            <div class="flex justify-between items-center mb-6">
+                <h3 id="modalTitle" class="text-2xl font-bold">Engine Settings</h3>
+                <button onclick="closeModal()" class="text-slate-400 hover:text-white"><i class="fas fa-times text-2xl"></i></button>
             </div>
-            <button onclick="closeApiModal()" class="w-full text-gray-500 text-[10px] mt-4 uppercase font-bold">Close</button>
+            
+            <div id="settingsContent">
+                <!-- Volume Matrix Table -->
+                <h4 class="text-lg font-semibold mb-4 text-blue-400">10-Level Volume SMA Matrix</h4>
+                <div class="overflow-x-auto">
+                    <table class="w-full text-sm text-left border-collapse">
+                        <thead>
+                            <tr class="border-b border-slate-700 text-slate-400">
+                                <th class="p-2">Level</th>
+                                <th class="p-2">Min SMA Avg</th>
+                                <th class="p-2">SMA Multiplier</th>
+                                <th class="p-2">Min Vol-Price (Cr)</th>
+                            </tr>
+                        </thead>
+                        <tbody id="matrixBody">
+                            <!-- Matrix Rows (1-10) injected here -->
+                        </tbody>
+                    </table>
+                </div>
+                
+                <div class="mt-8 flex justify-end">
+                    <button onclick="saveSettings()" class="bg-green-600 hover:bg-green-700 px-8 py-3 rounded-xl font-bold transition">
+                        Save All Configurations
+                    </button>
+                </div>
+            </div>
         </div>
     </div>
 
     <script>
-        lucide.createIcons();
-        let activeEngine = null;
-        let engines = { bull: false, bear: false, mom_bull: false, mom_bear: false };
+        let currentEngine = null;
 
-        // Fetch Stats, P&L, Heartbeat
-        async function fetchStats() {
+        // Render Engine Cards
+        const engineCards = document.getElementById('engine-cards');
+        engines.forEach(eng => {
+            engineCards.innerHTML += `
+                <div class="glass p-5 rounded-2xl border border-slate-700 flex flex-col justify-between">
+                    <div class="flex justify-between items-start mb-4">
+                        <span class="text-${eng.color}-400 font-bold uppercase tracking-wider">${eng.name}</span>
+                        <label class="switch">
+                            <input type="checkbox" id="toggle-${eng.id}" onchange="toggleEngine('${eng.id}', this.checked)">
+                            <span class="slider"></span>
+                        </label>
+                    </div>
+                    <div class="flex justify-between items-end">
+                        <div class="text-xs text-slate-500"> Trades: <span id="trades-${eng.id}" class="text-white">0</span></div>
+                        <button onclick="openSettings('${eng.id}')" class="text-slate-400 hover:text-white transition">
+                            <i class="fas fa-cog"></i> Settings
+                        </button>
+                    </div>
+                </div>
+            `;
+        });
+
+        // Initialize Matrix Rows
+        const matrixBody = document.getElementById('matrixBody');
+        for (let i = 1; i <= 10; i++) {
+            matrixBody.innerHTML += `
+                <tr class="border-b border-slate-800">
+                    <td class="p-2 text-slate-500 font-bold">${i}</td>
+                    <td class="p-2"><input type="number" id="min_sma_${i}" class="bg-slate-800 border-none rounded p-1 w-full" placeholder="0"></td>
+                    <td class="p-2"><input type="number" step="0.1" id="mult_${i}" class="bg-slate-800 border-none rounded p-1 w-full" placeholder="1.5"></td>
+                    <td class="p-2"><input type="number" step="0.01" id="vol_cr_${i}" class="bg-slate-800 border-none rounded p-1 w-full" placeholder="0.5"></td>
+                </tr>
+            `;
+        }
+
+        // --- Core Functions ---
+
+        async function updateStats() {
             try {
-                const res = await axios.get('/api/stats/');
-                const data = res.data;
-
-                // Heartbeat UI
-                const dot = document.getElementById('data-dot');
-                const txt = document.getElementById('data-text');
+                const res = await fetch('/api/stats/');
+                const data = await res.json();
+                
+                // Update Heartbeat
+                const hb = document.getElementById('heartbeat');
                 if (data.data_connected) {
-                    dot.className = "w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_#10b981]";
-                    txt.innerText = "Data Live"; txt.className = "text-[10px] font-black uppercase text-emerald-400";
+                    hb.innerHTML = "● Live";
+                    hb.className = "text-green-500";
                 } else {
-                    dot.className = "w-2.5 h-2.5 rounded-full bg-red-500 shadow-[0_0_8px_#ef4444]";
-                    txt.innerText = "Offline"; txt.className = "text-[10px] font-black uppercase text-red-500";
+                    hb.innerHTML = "● Offline";
+                    hb.className = "text-red-500 font-bold animate-pulse";
                 }
 
-                // Global P&L
-                const pnl = data.pnl.total || 0;
-                document.getElementById('total-pnl').innerText = "₹ " + pnl.toFixed(2);
-                document.getElementById('total-pnl').className = `text-lg font-black ${pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}`;
-
-                // Engine Toggles Sync
-                Object.keys(data.engine_status).forEach(eng => {
-                    updateToggleUI(eng, data.engine_status[eng] === "1");
+                // Update Toggles
+                engines.forEach(eng => {
+                    const toggle = document.getElementById(`toggle-${eng.id}`);
+                    toggle.checked = data.engine_status[eng.id] === "1";
                 });
 
-            } catch(e) { console.warn("Stats error", e); }
+                document.getElementById('pnl-total').innerText = `₹ ${data.pnl.total.toFixed(2)}`;
+            } catch (e) { console.error("Stats Error", e); }
         }
 
-        // Fetch Active Orders and Render Table
-        async function fetchOrders() {
+        async function toggleEngine(side, enabled) {
             try {
-                const res = await axios.get('/api/orders/');
-                const tbody = document.getElementById('trades-tbody');
-                tbody.innerHTML = '';
-                
-                let count = 0;
-                const strategies = ['bull', 'bear', 'mom_bull', 'mom_bear'];
-                strategies.forEach(eng => {
-                    const list = res.data[eng] || [];
-                    count += list.length;
-                    list.forEach(order => {
-                        const row = `
-                            <tr class="hover:bg-gray-800/30 transition-colors">
-                                <td class="px-4 py-3 font-black text-gray-200">${order.symbol}</td>
-                                <td class="px-4 py-3"><span class="px-2 py-0.5 rounded-full text-[9px] font-bold uppercase ${getBadgeColor(eng)}">${eng}</span></td>
-                                <td class="px-4 py-3 font-mono text-blue-400">${order.entry_price}</td>
-                                <td class="px-4 py-3 font-mono text-gray-300 font-bold">${order.ltp || '--'}</td>
-                                <td class="px-4 py-3 font-mono text-rose-400">${order.sl_price}</td>
-                                <td class="px-4 py-3 font-mono text-emerald-400">${order.target_price}</td>
-                                <td class="px-4 py-3 font-black ${order.pnl >= 0 ? 'text-emerald-400' : 'text-rose-400'}">₹ ${order.pnl.toFixed(1)}</td>
-                                <td class="px-4 py-3"><button onclick="manualExit('${order.symbol}')" class="bg-gray-800 hover:bg-rose-900 px-2 py-1 rounded text-white font-bold">X</button></td>
-                            </tr>
-                        `;
-                        tbody.innerHTML += row;
-                    });
+                const res = await fetch('/api/control/', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ action: 'toggle_engine', side: side, enabled: enabled })
                 });
-                document.getElementById('active-count').innerText = `${count} OPEN`;
-            } catch(e) { console.warn("Orders error", e); }
+                const result = await res.json();
+                console.log(`${side} is now ${enabled ? 'Started' : 'Stopped'}`);
+            } catch (e) { alert("Action Failed"); }
         }
 
-        // Fetch Scanner for all 4 panels
-        async function fetchScanner() {
-            try {
-                const res = await axios.get('/api/scanner/');
-                ['bull', 'bear', 'mom_bull', 'mom_bear'].forEach(eng => {
-                    const container = document.getElementById(`scanner-${eng}`);
-                    container.innerHTML = '';
-                    const signals = res.data[eng] || [];
-                    signals.forEach(s => {
-                        container.innerHTML += `
-                            <div class="flex justify-between items-center bg-gray-950 p-1.5 rounded border-b border-gray-800">
-                                <span class="font-black text-gray-400">${s.symbol}</span>
-                                <span class="text-gray-500 font-mono">${s.time}</span>
-                                <span class="font-bold text-gray-300">${s.price}</span>
-                            </div>
-                        `;
-                    });
-                });
-            } catch(e) { console.warn("Scanner error", e); }
-        }
-
-        function getBadgeColor(eng) {
-            if(eng === 'bull') return 'bg-emerald-900 text-emerald-400 border border-emerald-800';
-            if(eng === 'bear') return 'bg-rose-900 text-rose-400 border border-rose-800';
-            if(eng === 'mom_bull') return 'bg-blue-900 text-blue-400 border border-blue-800';
-            return 'bg-orange-900 text-orange-400 border border-orange-800';
-        }
-
-        function updateToggleUI(side, enabled) {
-            engines[side] = enabled;
-            const btn = document.getElementById(`btn-${side}-toggle`);
-            const dot = document.getElementById(`dot-${side}-toggle`);
-            if(!btn) return;
-
-            if(enabled) {
-                btn.className = `w-10 h-5 rounded-full relative transition-all ${getToggleColor(side)}`;
-                dot.className = `w-4 h-4 bg-white rounded-full absolute top-0.5 left-5 transition-all shadow-[0_0_8px_white]`;
-            } else {
-                btn.className = `w-10 h-5 rounded-full bg-gray-800 relative transition-all border border-gray-700`;
-                dot.className = `w-4 h-4 bg-gray-500 rounded-full absolute top-0.5 left-0.5 transition-all`;
-            }
-        }
-
-        function getToggleColor(side) {
-            if(side.includes('bull')) return 'bg-emerald-600';
-            if(side.includes('bear')) return 'bg-rose-600';
-            if(side.includes('mom_bull')) return 'bg-blue-600';
-            return 'bg-orange-600';
-        }
-
-        // --- Configuration Logic ---
         async function openSettings(side) {
-            activeEngine = side;
-            const modal = document.getElementById('settings-modal');
-            const title = document.getElementById('modal-title');
-            const matrixContainer = document.getElementById('vol-matrix-container');
+            currentEngine = side;
+            document.getElementById('modalTitle').innerText = `${side.toUpperCase()} Configurations`;
+            document.getElementById('settingsModal').style.display = 'flex';
             
-            title.innerText = `${side.toUpperCase()} CONFIGURATION`;
-            title.className = `text-sm font-black uppercase tracking-widest flex items-center gap-2 ${getColorClass(side)}`;
-            
-            const res = await axios.get(`/api/settings/engine/${side}/`);
-            const data = res.data;
-
-            document.getElementById('inp-rr').value = data.risk_reward || '1:2';
-            document.getElementById('inp-tsl').value = data.trailing_sl || '1:1.5';
-            document.getElementById('inp-max-trades').value = data.total_trades || 5;
-
-            // Cash specific
-            if(!side.includes('mom')) {
-                document.getElementById('cash-risk-box').classList.remove('hidden');
-                document.getElementById('inp-tps').value = data.trades_per_stock || 2;
-                document.getElementById('inp-r1').value = data.risk_trade_1 || 2000;
-                document.getElementById('inp-r2').value = data.risk_trade_2 || 1500;
-                document.getElementById('inp-r3').value = data.risk_trade_3 || 1000;
-            } else {
-                document.getElementById('cash-risk-box').classList.add('hidden');
-            }
-
-            // Render 10-Level Matrix
-            matrixContainer.innerHTML = '';
-            const criteria = data.volume_criteria || Array(10).fill({min_vol_price_cr: 0, sma_multiplier: 1, min_sma_avg: 0});
-            criteria.forEach((c, i) => {
-                matrixContainer.innerHTML += `
-                    <div class="grid grid-cols-4 gap-2 bg-gray-950 p-2 rounded border border-gray-800 items-center">
-                        <span class="text-[9px] font-bold text-gray-600">Level ${i+1}</span>
-                        <input class="m-cr bg-gray-900 border border-gray-700 rounded h-6 text-center text-[10px] text-amber-500 font-bold" value="${c.min_vol_price_cr}" placeholder="Cr">
-                        <input class="m-sma bg-gray-900 border border-gray-700 rounded h-6 text-center text-[10px] text-blue-400 font-bold" value="${c.sma_multiplier}" placeholder="SMA x">
-                        <input class="m-min bg-gray-900 border border-gray-700 rounded h-6 text-center text-[10px] text-emerald-500 font-bold" value="${c.min_sma_avg}" placeholder="Min V">
-                    </div>
-                `;
-            });
-
-            modal.classList.remove('hidden');
+            try {
+                const res = await fetch(`/api/settings/${side}/`);
+                const config = await res.json();
+                
+                // Populate Matrix
+                const matrix = config.volume_criteria || [];
+                for (let i = 1; i <= 10; i++) {
+                    const level = matrix[i-1] || {};
+                    document.getElementById(`min_sma_${i}`).value = level.min_sma_avg || "";
+                    document.getElementById(`mult_${i}`).value = level.sma_multiplier || "";
+                    document.getElementById(`vol_cr_${i}`).value = level.min_vol_price_cr || "";
+                }
+            } catch (e) { console.error("Load Settings Error", e); }
         }
 
         async function saveSettings() {
-            const crs = document.querySelectorAll('.m-cr');
-            const smas = document.querySelectorAll('.m-sma');
-            const mins = document.querySelectorAll('.m-min');
-            
-            const volume_criteria = [];
-            crs.forEach((_, i) => {
-                volume_criteria.push({
-                    min_vol_price_cr: parseFloat(crs[i].value),
-                    sma_multiplier: parseFloat(smas[i].value),
-                    min_sma_avg: parseInt(mins[i].value)
+            const matrix = [];
+            for (let i = 1; i <= 10; i++) {
+                matrix.push({
+                    min_sma_avg: document.getElementById(`min_sma_${i}`).value || 0,
+                    sma_multiplier: document.getElementById(`mult_${i}`).value || 1,
+                    min_vol_price_cr: document.getElementById(`vol_cr_${i}`).value || 0
                 });
-            });
-
-            const payload = {
-                risk_reward: document.getElementById('inp-rr').value,
-                trailing_sl: document.getElementById('inp-tsl').value,
-                total_trades: document.getElementById('inp-max-trades').value,
-                volume_criteria
-            };
-
-            if(!activeEngine.includes('mom')) {
-                payload.trades_per_stock = document.getElementById('inp-tps').value;
-                payload.risk_trade_1 = document.getElementById('inp-r1').value;
-                payload.risk_trade_2 = document.getElementById('inp-r2').value;
-                payload.risk_trade_3 = document.getElementById('inp-r3').value;
             }
 
-            await axios.post(`/api/settings/engine/${activeEngine}/`, payload);
-            closeSettings();
-            alert('Nexus RAM Updated!');
+            try {
+                const res = await fetch(`/api/settings/${currentEngine}/`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ volume_criteria: matrix })
+                });
+                if (res.ok) {
+                    alert("Settings Saved & Synced with Redis!");
+                    closeModal();
+                }
+            } catch (e) { alert("Save Failed"); }
         }
 
-        function getColorClass(side) {
-            if(side.includes('bull')) return 'text-emerald-400';
-            if(side.includes('bear')) return 'text-rose-400';
-            if(side.includes('mom_bull')) return 'text-blue-400';
-            return 'text-orange-400';
+        function closeModal() {
+            document.getElementById('settingsModal').style.display = 'none';
         }
 
-        // --- Basic Controls ---
-        function closeSettings() { document.getElementById('settings-modal').classList.add('hidden'); }
-        function openApiModal() { document.getElementById('api-modal').classList.remove('hidden'); }
-        function closeApiModal() { document.getElementById('api-modal').classList.add('hidden'); }
+        function panicAll() {
+            if(confirm("DANGER: Kya aap saare active trades close karna chahte hain?")) {
+                engines.forEach(eng => toggleEngine(eng.id, false));
+            }
+        }
 
-        async function toggleEngine(side) { await axios.post('/api/control/', { action: 'toggle_engine', side, enabled: !engines[side] }); }
-        async function manualExit(symbol) { await axios.post('/api/control/', { action: 'manual_exit', symbol }); }
-        async function panicExit(side) { if(confirm(`Confirm Panic Exit ${side}?`)) await axios.post('/api/control/', { action: 'panic_exit', side }); }
-
-        // Pollers
-        setInterval(() => {
-            fetchStats();
-            fetchOrders();
-            fetchScanner();
-        }, 1000);
-
-        window.onload = () => {
-            fetchStats();
-            fetchOrders();
-            fetchScanner();
-        };
+        // Auto Refresh
+        setInterval(updateStats, 2000);
+        window.onload = updateStats;
     </script>
 </body>
 </html>
