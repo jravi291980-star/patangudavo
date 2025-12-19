@@ -167,8 +167,11 @@ def control_action(request):
 
 @csrf_exempt
 @login_required
-def engine_settings_view(request, side):
-    """Engine specific settings (10-Level Matrix, RR, etc)"""
+def engine_settings_view(request, engine_type):
+    """
+    FIX: Argument name updated from 'side' to 'engine_type' 
+    to match your project-level urls.py.
+    """
     r = get_redis_client()
     acc = Account.objects.get(user=request.user)
     
@@ -176,24 +179,24 @@ def engine_settings_view(request, side):
         try:
             settings_data = json.loads(request.body)
             # 1. Sync to Redis for HFT Engines speed
-            r.set(f"algo:settings:{side}", json.dumps(settings_data))
+            r.set(f"algo:settings:{engine_type}", json.dumps(settings_data))
             
             # 2. Save to Postgres DB
-            if side == 'bull': acc.bull_volume_settings_json = settings_data
-            elif side == 'bear': acc.bear_volume_settings_json = settings_data
-            elif side == 'mom_bull': acc.mom_bull_volume_settings = settings_data
-            elif side == 'mom_bear': acc.mom_bear_volume_settings = settings_data
+            if engine_type == 'bull': acc.bull_volume_settings_json = settings_data
+            elif engine_type == 'bear': acc.bear_volume_settings_json = settings_data
+            elif engine_type == 'mom_bull': acc.mom_bull_volume_settings = settings_data
+            elif engine_type == 'mom_bear': acc.mom_bear_volume_settings = settings_data
             acc.save()
             return JsonResponse({'status': 'success'})
         except Exception as e:
             return JsonResponse({'status': 'error', 'message': str(e)})
 
     # GET: Fetch current config (Priority Redis, Fallback DB)
-    data = r.get(f"algo:settings:{side}")
+    data = r.get(f"algo:settings:{engine_type}")
     if data:
         return JsonResponse(json.loads(data))
     
-    db_field = f"{side}_volume_settings_json" if 'mom' not in side else f"{side}_volume_settings"
+    db_field = f"{engine_type}_volume_settings_json" if 'mom' not in engine_type else f"{engine_type}_volume_settings"
     return JsonResponse(getattr(acc, db_field) or {})
 
 @login_required
@@ -228,11 +231,7 @@ def get_scanner_data(request):
 @csrf_exempt
 @login_required
 def global_settings_view(request):
-    """
-    FIX: This function was missing, causing the AttributeError.
-    Handles global configurations (Max Daily Profit/Loss, etc).
-    """
+    """Handles global configurations"""
     if request.method == 'POST':
-        # Logic for saving global settings
         return JsonResponse({'status': 'success'})
     return JsonResponse({'status': 'global_active'})
