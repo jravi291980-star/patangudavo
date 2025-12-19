@@ -3,11 +3,14 @@ import redis
 import asyncio
 import logging
 import time
+import json
 from datetime import datetime
+from django.db import close_old_connections
 
 logger = logging.getLogger("HFT_Utils")
 
-# --- LUA Scripts ---
+# --- LUA Script for Atomic Trade Limiting ---
+# Isse ensure hota hai ki HFT speed par bhi "Max Trades" limit cross na ho.
 LUA_INC_LIMIT = """
 local key = KEYS[1]
 local limit = tonumber(ARGV[1])
@@ -20,11 +23,9 @@ else
 end
 """
 
-# Alias for backward compatibility if needed
-LUA_CHECK_AND_INC = LUA_INC_LIMIT
-
 class MockRedis:
-    """Redis offline hone par migrations ko crash hone se bachata hai"""
+    """Redis offline hone par ya migrations ke waqt crash hone se bachata hai."""
+    def __init__(self): self.is_mock = True
     def get(self, *args, **kwargs): return None
     def set(self, *args, **kwargs): return True
     def delete(self, *args, **kwargs): return True
@@ -37,45 +38,87 @@ class MockRedis:
 
 def get_redis_client():
     """
-    Safe Redis connection handler.
-    Agar Redis offline hai toh Mock object deta hai.
+    Heroku SSL Compatible Redis Client.
+    Production mein 'rediss://' URL aur SSL checks bypass handle karta hai.
     """
     redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379')
+    
     try:
-        r = redis.from_url(redis_url, decode_responses=True, socket_timeout=1)
+        if redis_url.startswith('rediss://'):
+            # Heroku Redis requires SSL but uses self-signed certs
+            r = redis.from_url(
+                redis_url, 
+                decode_responses=True, 
+                ssl_cert_reqs=None 
+            )
+        else:
+            r = redis.from_url(redis_url, decode_responses=True)
+            
         r.ping()
         return r
-    except (redis.exceptions.ConnectionError, redis.exceptions.TimeoutError):
-        logger.warning("Redis connection refused. Using MockRedis for this session.")
+    except Exception as e:
+        logger.warning(f"Redis Connection Failed ({e}). Using MockRedis.")
         return MockRedis()
 
-# Global Client for functions below
-REDIS_CLIENT = get_redis_client()
-
-def check_redis_limit(user_id, engine_label, limit):
-    """Redis level par atomic limit check"""
-    key = f"trading:limit:{user_id}:{engine_label}"
-    # Use global client or get new one
-    r = REDIS_CLIENT
-    result = r.eval(LUA_INC_LIMIT, 1, key, limit)
-    return result != -1
+# Global Instance
+r_client = get_redis_client()
 
 def log_performance(strategy, symbol, trigger_time):
-    """HFT Latency monitor karne ke liye helper function"""
-    latency = (time.perf_counter() - trigger_time) * 1000 # Milliseconds
-    perf_key = f"perf:latency:{strategy}"
-    REDIS_CLIENT.hset(perf_key, symbol, f"{latency:.2f}ms")
-    logger.info(f"PERF | {strategy} | {symbol} | Latency: {latency:.2f}ms")
-    return latency
+    """Execution latency measure karne ke liye."""
+    latency = (time.perf_counter() - trigger_time) * 1000 
+    r_client.hset(f"perf:latency:{strategy}", symbol, f"{latency:.2f}ms")
+    logger.info(f"LATENCY | {strategy} | {symbol} | {latency:.2f}ms")
 
-async def db_sync_worker(queue):
-    """Background worker jo trades ko Postgres mein save karega"""
+async def hft_db_sync_worker(queue):
+    """
+    Nexus Engines se trades lekar Postgres Database mein save karne wala worker.
+    Isse HFT execution engine par load nahi padta.
+    """
+    from trading.models import (
+        CashBreakoutTrade, CashBreakdownTrade, 
+        MomentumBullTrade, MomentumBearTrade
+    )
+    from django.contrib.auth.models import User
+
+    logger.info("DB Sync Worker Started...")
+    user = User.objects.get(id=1) # Default Master User
+
     while True:
-        trade_data = await queue.get()
+        data = await queue.get()
         try:
-            # Persistence logic placeholder
-            pass
+            # Django connection refresh (Heroku DB safety)
+            close_old_connections()
+            
+            reason = data.get('reason', '')
+            side = data.get('side')
+            
+            # Model mapping logic
+            model = None
+            if 'BULL_BREAKOUT' in reason: model = CashBreakoutTrade
+            elif 'BEAR_BREAKDOWN' in reason: model = CashBreakdownTrade
+            elif 'MOM_BULL' in reason: model = MomentumBullTrade
+            elif 'MOM_BEAR' in reason: model = MomentumBearTrade
+
+            if model and side in ['BUY', 'SELL']:
+                # New entry creation
+                model.objects.create(
+                    user=user,
+                    symbol=data['symbol'],
+                    entry_price=data['price'],
+                    qty=data['qty'],
+                    order_id=data['oid'],
+                    status='OPEN'
+                )
+            elif model and side in ['EXIT', 'SELL', 'BUY'] and 'EXIT' in reason:
+                # Update existing trade status
+                trade = model.objects.filter(user=user, symbol=data['symbol'], status='OPEN').last()
+                if trade:
+                    trade.status = 'EXITED'
+                    trade.exit_price = data['price']
+                    # PnL automatically calculate logic (optional)
+                    trade.save()
+
         except Exception as e:
-            logger.error(f"DB Sync Error: {e}")
+            logger.error(f"DB Worker Persistence Error: {e}")
         finally:
             queue.task_done()
